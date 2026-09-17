@@ -1,0 +1,10 @@
+# ignoring private building notes , status and other files
+.agent
+.env
+*.pem
+.trustgate-dev/
+bin/
+build/
+# generated locally by `make publish` / demos
+registry/manifests/
+receipt.json

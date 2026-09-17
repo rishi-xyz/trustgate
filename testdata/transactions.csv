@@ -1,0 +1,16 @@
+supplier,month,amount
+acme,jan,100.50
+acme,feb,110.25
+beta,jan,90.00
+beta,feb,95.75
+acme,mar,105.10
+beta,mar,100.40
+acme,apr,98.60
+beta,apr,102.20
+acme,may,101.00
+beta,may,99.90
+acme,jun,103.30
+beta,jun,97.45
+acme,jul,99.80
+beta,jul,101.10
+gamma,jul,50000.00

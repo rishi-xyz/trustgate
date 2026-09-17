@@ -1,0 +1,7 @@
+# Local, INSECURE dev-mode run (no enclave). Run `make publish` first.
+services:
+  trustgate:
+    build: .
+    ports: ["8080:8080"]
+    environment:
+      TRUSTGATE_TOKEN: ${TRUSTGATE_TOKEN:-dev-token}

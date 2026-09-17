@@ -1,0 +1,8 @@
+.git
+.agent
+bin
+build
+.trustgate-dev/*.key
+.trustgate-dev/*.log
+.trustgate-dev/*.json
+.trustgate-dev/root.key

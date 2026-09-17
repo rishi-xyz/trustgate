@@ -1,0 +1,16 @@
+# Enclave image. Everything the server trusts (workload registry, publisher
+# public key) is baked in, so it is covered by the enclave measurement (PCR0).
+# Build the registry first on the build host: `make publish`.
+FROM golang:1.26-bookworm AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -trimpath -ldflags='-s -w -buildid=' -o /out/trustgate-server ./cmd/trustgate-server
+
+FROM gcr.io/distroless/static-debian12
+COPY --from=build /out/trustgate-server /trustgate-server
+COPY registry/manifests /registry
+COPY .trustgate-dev/publisher.pub /publisher.pub
+# No TCP inside an enclave: serve over vsock; the parent forwards TCP -> vsock.
+ENTRYPOINT ["/trustgate-server", "-mode", "nitro", "-registry", "/registry", "-publisher-pub-file", "/publisher.pub", "-vsock-port", "8080", "-control-vsock-port", "8081"]

@@ -22,6 +22,7 @@ import (
 	"trustgate/internal/kms"
 	"trustgate/internal/receipts"
 	"trustgate/internal/registry"
+	"trustgate/internal/seal"
 	"trustgate/internal/server"
 )
 
@@ -53,6 +54,8 @@ func main() {
 	var (
 		provider attest.Provider
 		devTrust []byte
+		keys     seal.KeyProvider
+		kmsProv  *kms.Provider
 	)
 	switch *mode {
 	case attest.ModeDev:
@@ -61,6 +64,12 @@ func main() {
 			log.Fatal(err)
 		}
 		provider, devTrust = d, d.TrustKey()
+		dk, err := seal.LoadDevKMS(filepath.Join(*devDir, "kms-master.key"))
+		if err != nil {
+			log.Fatal(err)
+		}
+		keys = dk
+		log.Println("confidential jobs: DEV KMS (local master key, no protection from this machine's operator)")
 		log.Println("*** DEV MODE: software-only attestation, NO hardware isolation. Do not use with real data. ***")
 	case attest.ModeNitro:
 		n, err := attest.NewNitro()
@@ -68,6 +77,15 @@ func main() {
 			log.Fatal(err)
 		}
 		provider = n
+		// Data keys are unwrapped by attested KMS calls through the parent's
+		// vsock-proxy, using credentials the parent pushes over the control channel.
+		kmsProv = &kms.Provider{
+			Attester: n,
+			Dial: func(_ context.Context, _, _ string) (net.Conn, error) {
+				return vsock.Dial(3, uint32(*kmsProxy), nil)
+			},
+		}
+		keys = kmsProv
 	default:
 		log.Fatalf("unknown -mode %q", *mode)
 	}
@@ -83,6 +101,7 @@ func main() {
 		Provider: provider,
 		DevTrust: devTrust,
 		Token:    os.Getenv("TRUSTGATE_TOKEN"),
+		Keys:     keys,
 	})
 	if err != nil {
 		log.Fatal(err)
@@ -98,6 +117,7 @@ func main() {
 			log.Fatal("control channel needs -mode nitro")
 		}
 		ctl := &control.Handler{
+			Keys:        kmsProv,
 			Attester:    att,
 			Measurement: provider.Measurement(),
 			Dial: func(_ context.Context, _, _ string) (net.Conn, error) {

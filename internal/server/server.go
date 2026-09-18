@@ -21,6 +21,7 @@ import (
 	"trustgate/internal/receipts"
 	"trustgate/internal/registry"
 	"trustgate/internal/runtime"
+	"trustgate/internal/seal"
 	"trustgate/internal/verify"
 )
 
@@ -34,6 +35,8 @@ type Config struct {
 	DevTrust []byte
 	// Token, if non-empty, is required as a Bearer token on /mcp.
 	Token string
+	// Keys unwraps data keys for confidential (sealed) jobs. Nil disables them.
+	Keys seal.KeyProvider
 }
 
 // Server holds runtime state.
@@ -66,6 +69,10 @@ type ExecuteInput struct {
 	Args      []string `json:"args,omitempty" jsonschema:"command-line arguments for the workload"`
 	MemoryMB  uint32   `json:"memory_mb,omitempty" jsonschema:"memory limit in MB; defaults to and may not exceed the workload manifest maximum"`
 	TimeoutMS uint32   `json:"timeout_ms,omitempty" jsonschema:"time limit in ms; defaults to and may not exceed the workload manifest maximum"`
+	// SealedInput runs the job on confidential data: the input is encrypted so
+	// only the enclave can read it, bound to this workload, these args and the
+	// recipient key, and the result comes back sealed to that key.
+	SealedInput *seal.SealedInput `json:"sealed_input,omitempty" jsonschema:"confidential input created with 'trustgate seal'; mutually exclusive with input and input_b64"`
 }
 
 // stdin returns the raw input bytes described by the request.
@@ -88,6 +95,9 @@ type ExecuteOutput struct {
 	Output  string         `json:"output"`
 	Stderr  string         `json:"stderr,omitempty"`
 	Receipt map[string]any `json:"receipt_bundle" jsonschema:"signed receipt plus attestation; pass to verify_receipt, replay or the trustgate CLI"`
+	// SealedOutput replaces Output/Stderr for confidential jobs; only the holder
+	// of the recipient private key can read it.
+	SealedOutput *seal.SealedOutput `json:"sealed_output,omitempty"`
 }
 
 // prepared is a validated execution request.
@@ -96,6 +106,8 @@ type prepared struct {
 	lim   runtime.Limits
 	stdin []byte
 	args  []string
+	// sealed is set for confidential jobs; stdin is then decrypted at run time.
+	sealed *seal.SealedInput
 }
 
 // prepare validates a request without running anything, so bad requests are
@@ -119,6 +131,18 @@ func (s *Server) prepare(in ExecuteInput) (*prepared, error) {
 		}
 		lim.TimeoutMS = in.TimeoutMS
 	}
+	if in.SealedInput != nil {
+		if in.Input != "" || in.InputB64 != "" {
+			return nil, errors.New("sealed_input cannot be combined with input or input_b64")
+		}
+		if s.cfg.Keys == nil {
+			return nil, errors.New("confidential jobs are not enabled on this server")
+		}
+		if err := in.SealedInput.Validate(); err != nil {
+			return nil, fmt.Errorf("sealed_input: %w", err)
+		}
+		return &prepared{wl: wl, lim: lim, args: append([]string{}, in.Args...), sealed: in.SealedInput}, nil
+	}
 	stdin, err := stdinBytes(in.Input, in.InputB64)
 	if err != nil {
 		return nil, err
@@ -131,7 +155,28 @@ func (s *Server) prepare(in ExecuteInput) (*prepared, error) {
 // cancelled run returns context.Canceled in runErr with no receipt.
 func (s *Server) runPrepared(ctx context.Context, p *prepared) (out ExecuteOutput, runErr, err error) {
 	m := p.wl.Manifest
-	res, runErr := runtime.Run(ctx, p.wl.Wasm, p.stdin, p.args, p.lim)
+	stdin := p.stdin
+	var saltIn, saltOut []byte
+	var ctHash string
+	if p.sealed != nil {
+		wrapped, _ := p.sealed.WrappedKey()
+		ct, _ := p.sealed.CiphertextBytes()
+		ctHash = canon.SHA256(ct)
+		dk, kerr := s.cfg.Keys.DecryptDataKey(ctx, wrapped)
+		if kerr != nil {
+			return ExecuteOutput{}, nil, fmt.Errorf("could not unwrap the data key: %w", kerr)
+		}
+		saltIn, stdin, err = seal.OpenInput(dk, p.sealed, m.SHA256, p.args)
+		clear(dk)
+		if err != nil {
+			return ExecuteOutput{}, nil, err
+		}
+		saltOut = make([]byte, seal.SaltSize)
+		if _, err := rand.Read(saltOut); err != nil {
+			return ExecuteOutput{}, nil, err
+		}
+	}
+	res, runErr := runtime.Run(ctx, p.wl.Wasm, stdin, p.args, p.lim)
 	if errors.Is(runErr, context.Canceled) {
 		return ExecuteOutput{}, runErr, nil
 	}
@@ -142,7 +187,7 @@ func (s *Server) runPrepared(ctx context.Context, p *prepared) (out ExecuteOutpu
 		Workload:        m.Name + "@" + m.Version,
 		CodeSHA256:      m.SHA256,
 		Args:            p.args,
-		Inputs:          []receipts.InputRef{{Name: "stdin", SHA256: canon.SHA256(p.stdin)}},
+		Inputs:          []receipts.InputRef{{Name: "stdin", SHA256: canon.SHA256(stdin)}},
 		Runtime:         receipts.Runtime{Engine: runtime.Engine, Profile: m.Profile},
 		Limits:          receipts.Limits{MemoryMB: p.lim.MemoryMB, TimeoutMS: p.lim.TimeoutMS},
 		AttestationMode: s.cfg.Provider.Mode(),
@@ -153,6 +198,12 @@ func (s *Server) runPrepared(ctx context.Context, p *prepared) (out ExecuteOutpu
 		rec.Execution.DurationMS = res.Duration.Milliseconds()
 	}
 	rec.OutputSHA256 = canon.SHA256(stdout)
+	if p.sealed != nil {
+		// Commit with secret salts so the parent cannot brute-force small data.
+		rec.Inputs[0].SHA256 = seal.SaltedSHA256(saltIn, stdin)
+		rec.OutputSHA256 = seal.SaltedSHA256(saltOut, stdout)
+		rec.Confidential = &receipts.Confidential{InputCiphertextSHA256: ctHash, RecipientPub: p.sealed.RecipientPub}
+	}
 	rec.Execution.Status = "success"
 	if runErr != nil {
 		rec.Execution.Status = "error"
@@ -167,7 +218,18 @@ func (s *Server) runPrepared(ctx context.Context, p *prepared) (out ExecuteOutpu
 	if err != nil {
 		return ExecuteOutput{}, nil, err
 	}
-	return ExecuteOutput{Status: rec.Execution.Status, Output: string(stdout), Stderr: string(stderr), Receipt: asMap}, runErr, nil
+	out = ExecuteOutput{Status: rec.Execution.Status, Output: string(stdout), Stderr: string(stderr), Receipt: asMap}
+	if p.sealed != nil {
+		pub, _ := hex.DecodeString(p.sealed.RecipientPub)
+		so, err := seal.SealOutput(pub, seal.OutputPayload{Stdout: stdout, Salt: saltOut}, ctHash)
+		if err != nil {
+			return ExecuteOutput{}, nil, err
+		}
+		// Nothing derived from confidential data leaves in the clear, including
+		// the workload's stderr.
+		out.Output, out.Stderr, out.SealedOutput = "", "", so
+	}
+	return out, runErr, nil
 }
 
 func (s *Server) execute(ctx context.Context, _ *mcp.CallToolRequest, in ExecuteInput) (*mcp.CallToolResult, ExecuteOutput, error) {
@@ -209,6 +271,9 @@ func (s *Server) replay(ctx context.Context, _ *mcp.CallToolRequest, in ReplayIn
 	var b receipts.Bundle
 	if err := json.Unmarshal(raw, &b); err != nil {
 		return nil, ReplayOutput{}, fmt.Errorf("bad bundle: %w", err)
+	}
+	if b.Receipt.Confidential != nil {
+		return nil, ReplayOutput{}, errors.New("confidential receipts cannot be replayed on the server without sending it the plaintext; replay locally with `trustgate replay -salts`")
 	}
 	wl, ok := s.cfg.Registry.Get(b.Receipt.CodeSHA256)
 	if !ok {

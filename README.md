@@ -18,6 +18,16 @@ Known gaps: builds are not reproducible yet (every rebuild changes PCR0, so the 
 
 TrustGate proves what code ran on which input in which environment. It does not prove the result is correct.
 
+## MCP tools
+
+| Tool | Purpose |
+|---|---|
+| `execute` | Run an approved workload; input as text (`input`) or raw bytes (`input_b64`); returns output plus a signed receipt bundle |
+| `execute_async`, `job_status`, `job_result`, `cancel_job` | Long-running jobs: get a `job_id` immediately, poll, fetch the result, or cancel. Plain tools rather than the MCP Tasks extension (the Go SDK has no Tasks support yet) |
+| `replay` | Re-run the workload in a receipt against the original input and compare the output hash (same server; replay on your own machine for independent evidence) |
+| `verify_receipt` | Check signature, attestation, key binding and an optional pinned measurement |
+| `list_workloads`, `get_attestation` | Discover approved workloads and the server's attestation evidence |
+
 ## Quick start (local)
 
 ```bash

@@ -21,6 +21,16 @@ echo; echo "== verify"
 bin/trustgate verify .trustgate-dev/receipt.json $V
 echo; echo "== replay"
 bin/trustgate replay .trustgate-dev/receipt.json $V -wasm build/csv-stats.wasm -stdin testdata/transactions.csv
+echo; echo "== binary input (random bytes, not valid text)"
+head -c 100000 /dev/urandom >.trustgate-dev/blob.bin
+bin/trustgate exec -url "http://localhost:$PORT/mcp" -workload hash-bytes -input .trustgate-dev/blob.bin -out .trustgate-dev/blob-receipt.json
+echo "local sha256: $(sha256sum .trustgate-dev/blob.bin | cut -d' ' -f1)"
+bin/trustgate replay .trustgate-dev/blob-receipt.json $V -wasm build/hash-bytes.wasm -stdin .trustgate-dev/blob.bin | tail -3
+
+echo; echo "== async long-running job (primes below 60M), polled until done"
+bin/trustgate exec -async -url "http://localhost:$PORT/mcp" -workload primes -args 60000000 -out .trustgate-dev/async-receipt.json
+bin/trustgate verify .trustgate-dev/async-receipt.json $V | tail -2
+
 echo; echo "== attack: flip one input byte, replay must fail"
 sed 's/50000.00/50000.01/' testdata/transactions.csv >.trustgate-dev/tampered.csv
 bin/trustgate replay .trustgate-dev/receipt.json $V -wasm build/csv-stats.wasm -stdin .trustgate-dev/tampered.csv && { echo "UNEXPECTED PASS"; exit 1; } || echo "(failed as expected)"

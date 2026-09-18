@@ -40,6 +40,7 @@ type Config struct {
 type Server struct {
 	cfg         Config
 	attestation []byte
+	jobs        *jobStore
 }
 
 // New creates the server and obtains the boot attestation document that binds
@@ -53,56 +54,97 @@ func New(cfg Config) (*Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("attest: %w", err)
 	}
-	return &Server{cfg: cfg, attestation: doc}, nil
+	s := &Server{cfg: cfg, attestation: doc}
+	s.jobs = newJobStore(s)
+	return s, nil
 }
 
 type ExecuteInput struct {
 	Workload  string   `json:"workload" jsonschema:"workload name or sha256:<hex> from list_workloads"`
-	Input     string   `json:"input,omitempty" jsonschema:"text passed to the workload on stdin"`
+	Input     string   `json:"input,omitempty" jsonschema:"UTF-8 text passed to the workload on stdin (use input_b64 for binary data; set only one)"`
+	InputB64  string   `json:"input_b64,omitempty" jsonschema:"base64-encoded bytes passed to the workload on stdin, for binary data (set only one of input and input_b64)"`
 	Args      []string `json:"args,omitempty" jsonschema:"command-line arguments for the workload"`
 	MemoryMB  uint32   `json:"memory_mb,omitempty" jsonschema:"memory limit in MB; defaults to and may not exceed the workload manifest maximum"`
 	TimeoutMS uint32   `json:"timeout_ms,omitempty" jsonschema:"time limit in ms; defaults to and may not exceed the workload manifest maximum"`
+}
+
+// stdin returns the raw input bytes described by the request.
+func stdinBytes(text, b64 string) ([]byte, error) {
+	if text != "" && b64 != "" {
+		return nil, errors.New("set only one of input and input_b64")
+	}
+	if b64 == "" {
+		return []byte(text), nil
+	}
+	raw, err := base64.StdEncoding.DecodeString(b64)
+	if err != nil {
+		return nil, fmt.Errorf("input_b64 is not valid base64: %w", err)
+	}
+	return raw, nil
 }
 
 type ExecuteOutput struct {
 	Status  string         `json:"status"`
 	Output  string         `json:"output"`
 	Stderr  string         `json:"stderr,omitempty"`
-	Receipt map[string]any `json:"receipt_bundle" jsonschema:"signed receipt plus attestation; pass to verify_receipt or the trustgate CLI"`
+	Receipt map[string]any `json:"receipt_bundle" jsonschema:"signed receipt plus attestation; pass to verify_receipt, replay or the trustgate CLI"`
 }
 
-func (s *Server) execute(ctx context.Context, _ *mcp.CallToolRequest, in ExecuteInput) (*mcp.CallToolResult, ExecuteOutput, error) {
+// prepared is a validated execution request.
+type prepared struct {
+	wl    *registry.Workload
+	lim   runtime.Limits
+	stdin []byte
+	args  []string
+}
+
+// prepare validates a request without running anything, so bad requests are
+// rejected up front (including for async jobs).
+func (s *Server) prepare(in ExecuteInput) (*prepared, error) {
 	wl, ok := s.cfg.Registry.Get(in.Workload)
 	if !ok {
-		return nil, ExecuteOutput{}, fmt.Errorf("unknown workload %q", in.Workload)
+		return nil, fmt.Errorf("unknown workload %q", in.Workload)
 	}
 	m := wl.Manifest
 	lim := runtime.Limits{MemoryMB: m.MaxMemoryMB, TimeoutMS: m.MaxTimeoutMS}
 	if in.MemoryMB != 0 {
 		if in.MemoryMB > m.MaxMemoryMB {
-			return nil, ExecuteOutput{}, fmt.Errorf("memory_mb %d exceeds workload maximum %d", in.MemoryMB, m.MaxMemoryMB)
+			return nil, fmt.Errorf("memory_mb %d exceeds workload maximum %d", in.MemoryMB, m.MaxMemoryMB)
 		}
 		lim.MemoryMB = in.MemoryMB
 	}
 	if in.TimeoutMS != 0 {
 		if in.TimeoutMS > m.MaxTimeoutMS {
-			return nil, ExecuteOutput{}, fmt.Errorf("timeout_ms %d exceeds workload maximum %d", in.TimeoutMS, m.MaxTimeoutMS)
+			return nil, fmt.Errorf("timeout_ms %d exceeds workload maximum %d", in.TimeoutMS, m.MaxTimeoutMS)
 		}
 		lim.TimeoutMS = in.TimeoutMS
 	}
+	stdin, err := stdinBytes(in.Input, in.InputB64)
+	if err != nil {
+		return nil, err
+	}
+	return &prepared{wl: wl, lim: lim, stdin: stdin, args: append([]string{}, in.Args...)}, nil
+}
 
-	stdin := []byte(in.Input)
-	res, runErr := runtime.Run(ctx, wl.Wasm, stdin, in.Args, lim)
+// runPrepared executes and signs a receipt. runErr is the execution outcome
+// (still accompanied by a signed receipt); err is an internal failure. A
+// cancelled run returns context.Canceled in runErr with no receipt.
+func (s *Server) runPrepared(ctx context.Context, p *prepared) (out ExecuteOutput, runErr, err error) {
+	m := p.wl.Manifest
+	res, runErr := runtime.Run(ctx, p.wl.Wasm, p.stdin, p.args, p.lim)
+	if errors.Is(runErr, context.Canceled) {
+		return ExecuteOutput{}, runErr, nil
+	}
 
 	var stdout, stderr []byte
 	rec := receipts.Receipt{
 		Tenant:          s.cfg.Tenant,
 		Workload:        m.Name + "@" + m.Version,
 		CodeSHA256:      m.SHA256,
-		Args:            append([]string{}, in.Args...),
-		Inputs:          []receipts.InputRef{{Name: "stdin", SHA256: canon.SHA256(stdin)}},
+		Args:            p.args,
+		Inputs:          []receipts.InputRef{{Name: "stdin", SHA256: canon.SHA256(p.stdin)}},
 		Runtime:         receipts.Runtime{Engine: runtime.Engine, Profile: m.Profile},
-		Limits:          receipts.Limits{MemoryMB: lim.MemoryMB, TimeoutMS: lim.TimeoutMS},
+		Limits:          receipts.Limits{MemoryMB: p.lim.MemoryMB, TimeoutMS: p.lim.TimeoutMS},
 		AttestationMode: s.cfg.Provider.Mode(),
 	}
 	if res != nil {
@@ -119,18 +161,70 @@ func (s *Server) execute(ctx context.Context, _ *mcp.CallToolRequest, in Execute
 
 	bundle, err := s.cfg.Signer.Sign(rec, s.attestation)
 	if err != nil {
-		return nil, ExecuteOutput{}, err
+		return ExecuteOutput{}, nil, err
 	}
 	asMap, err := toMap(bundle)
 	if err != nil {
+		return ExecuteOutput{}, nil, err
+	}
+	return ExecuteOutput{Status: rec.Execution.Status, Output: string(stdout), Stderr: string(stderr), Receipt: asMap}, runErr, nil
+}
+
+func (s *Server) execute(ctx context.Context, _ *mcp.CallToolRequest, in ExecuteInput) (*mcp.CallToolResult, ExecuteOutput, error) {
+	p, err := s.prepare(in)
+	if err != nil {
 		return nil, ExecuteOutput{}, err
 	}
-	out := ExecuteOutput{Status: rec.Execution.Status, Output: string(stdout), Stderr: string(stderr), Receipt: asMap}
+	out, runErr, err := s.runPrepared(ctx, p)
+	if err != nil {
+		return nil, ExecuteOutput{}, err
+	}
 	if runErr != nil {
+		if errors.Is(runErr, context.Canceled) {
+			return nil, ExecuteOutput{}, runErr
+		}
 		// Fail closed, but still hand back the signed receipt of the failure.
 		return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{&mcp.TextContent{Text: "execution failed: " + runErr.Error()}}}, out, nil
 	}
 	return nil, out, nil
+}
+
+type ReplayInput struct {
+	Bundle   map[string]any `json:"receipt_bundle" jsonschema:"the receipt_bundle returned by execute"`
+	Input    string         `json:"input,omitempty" jsonschema:"the original UTF-8 text input (set only one of input and input_b64)"`
+	InputB64 string         `json:"input_b64,omitempty" jsonschema:"the original input as base64 bytes"`
+}
+
+type ReplayOutput struct {
+	Matches bool           `json:"replay_matches" jsonschema:"true only if the receipt verified and the re-execution reproduced the recorded output hash"`
+	Checks  []verify.Check `json:"checks"`
+	Note    string         `json:"note"`
+}
+
+func (s *Server) replay(ctx context.Context, _ *mcp.CallToolRequest, in ReplayInput) (*mcp.CallToolResult, ReplayOutput, error) {
+	raw, err := json.Marshal(in.Bundle)
+	if err != nil {
+		return nil, ReplayOutput{}, err
+	}
+	var b receipts.Bundle
+	if err := json.Unmarshal(raw, &b); err != nil {
+		return nil, ReplayOutput{}, fmt.Errorf("bad bundle: %w", err)
+	}
+	wl, ok := s.cfg.Registry.Get(b.Receipt.CodeSHA256)
+	if !ok {
+		return nil, ReplayOutput{}, fmt.Errorf("workload %s is not in this server's registry; replay it yourself with the trustgate CLI and the .wasm", b.Receipt.CodeSHA256)
+	}
+	stdin, err := stdinBytes(in.Input, in.InputB64)
+	if err != nil {
+		return nil, ReplayOutput{}, err
+	}
+	checks := verify.Bundle(&b, verify.Options{AllowDev: s.cfg.Provider.Mode() == attest.ModeDev, DevTrust: s.cfg.DevTrust})
+	checks = append(checks, verify.Replay(ctx, &b, wl.Wasm, stdin)...)
+	return nil, ReplayOutput{
+		Matches: verify.OK(checks),
+		Checks:  checks,
+		Note:    "Replayed by this same server. For independent evidence, replay on your own machine: trustgate replay <bundle> -wasm <file> -stdin <file>.",
+	}, nil
 }
 
 type ListInput struct{}
@@ -203,6 +297,11 @@ func (s *Server) MCP() *mcp.Server {
 			"The receipt proves what code ran on what input in which environment, not that the result is semantically correct.",
 	})
 	mcp.AddTool(srv, &mcp.Tool{Name: "execute", Description: "Run an approved WASM workload with deny-by-default capabilities and resource limits; returns output plus a signed receipt."}, s.execute)
+	mcp.AddTool(srv, &mcp.Tool{Name: "execute_async", Description: "Start a long-running workload and return a job_id immediately. Poll job_status, then fetch the output and signed receipt with job_result."}, s.jobs.submit)
+	mcp.AddTool(srv, &mcp.Tool{Name: "job_status", Description: "Status of an async job: queued, running, succeeded, failed or cancelled."}, s.jobs.status)
+	mcp.AddTool(srv, &mcp.Tool{Name: "job_result", Description: "Output and signed receipt bundle of a finished async job (status and no result while still running)."}, s.jobs.result)
+	mcp.AddTool(srv, &mcp.Tool{Name: "cancel_job", Description: "Cancel a queued or running async job. A cancelled job produces no receipt."}, s.jobs.cancel)
+	mcp.AddTool(srv, &mcp.Tool{Name: "replay", Description: "Re-run the workload recorded in a receipt against the original input and check that the output hash is reproduced. Only meaningful for deterministic-v1 receipts."}, s.replay)
 	mcp.AddTool(srv, &mcp.Tool{Name: "list_workloads", Description: "List approved, publisher-signed workloads."}, s.list)
 	mcp.AddTool(srv, &mcp.Tool{Name: "get_attestation", Description: "Return this server's attestation evidence and receipt-signing key."}, s.getAttestation)
 	mcp.AddTool(srv, &mcp.Tool{Name: "verify_receipt", Description: "Verify a receipt bundle (signature, attestation, key binding, optional measurement pin)."}, s.verifyReceipt)

@@ -17,8 +17,15 @@ import (
 	"trustgate/internal/kms"
 )
 
+// Ops understood by the control channel.
+const (
+	OpKMSTest  = "kms-test"  // decrypt a ciphertext with the request's own credentials
+	OpSetCreds = "set-creds" // store credentials used for confidential jobs
+)
+
 // Request is sent by the parent tool (one JSON object per connection).
 type Request struct {
+	Op            string    `json:"op,omitempty"`
 	Region        string    `json:"region"`
 	Creds         kms.Creds `json:"creds"`
 	CiphertextB64 string    `json:"ciphertext_b64"`
@@ -35,6 +42,9 @@ type Response struct {
 }
 
 type Handler struct {
+	// Keys receives credentials from set-creds; the server uses it to unwrap
+	// data keys for confidential jobs. May be nil.
+	Keys        *kms.Provider
 	Attester    kms.Attester
 	Measurement string
 	Dial        func(ctx context.Context, network, addr string) (net.Conn, error)
@@ -59,7 +69,15 @@ func (h *Handler) handle(c net.Conn) {
 		_ = json.NewEncoder(c).Encode(Response{Error: "bad request: " + err.Error()})
 		return
 	}
-	resp := h.decrypt(&req)
+	var resp Response
+	switch req.Op {
+	case "", OpKMSTest:
+		resp = h.decrypt(&req)
+	case OpSetCreds:
+		resp = h.setCreds(&req)
+	default:
+		resp = Response{Error: "unknown op " + req.Op}
+	}
 	if !resp.OK {
 		log.Printf("control: %s", resp.Error)
 	}
@@ -81,4 +99,16 @@ func (h *Handler) decrypt(req *Request) Response {
 	}
 	sum := sha256.Sum256(pt)
 	return Response{OK: true, PlaintextSHA256: hex.EncodeToString(sum[:]), PlaintextLen: len(pt), Measurement: h.Measurement}
+}
+
+func (h *Handler) setCreds(req *Request) Response {
+	if h.Keys == nil {
+		return Response{Error: "confidential jobs are not enabled on this server"}
+	}
+	if req.Region == "" || req.Creds.AccessKeyID == "" {
+		return Response{Error: "set-creds needs region and credentials"}
+	}
+	syncClock(req.UnixTime)
+	h.Keys.SetCreds(req.Region, req.Creds)
+	return Response{OK: true, Measurement: h.Measurement}
 }

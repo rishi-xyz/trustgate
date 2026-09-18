@@ -1,17 +1,23 @@
 package tests
 
 import (
+	"bytes"
 	"context"
+	"crypto/ecdh"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -22,6 +28,7 @@ import (
 	"trustgate/internal/receipts"
 	"trustgate/internal/registry"
 	"trustgate/internal/runtime"
+	"trustgate/internal/seal"
 	"trustgate/internal/server"
 	"trustgate/internal/verify"
 )
@@ -46,6 +53,8 @@ func buildWasm(t *testing.T, pkg, out string) []byte {
 var hashBytesWasm []byte
 
 type env struct {
+	srv       *server.Server
+	kms       *seal.DevKMS
 	dir       string
 	pubKey    ed25519.PublicKey
 	privKey   ed25519.PrivateKey
@@ -75,7 +84,9 @@ func must(t *testing.T, err error) {
 	}
 }
 
-func setup(t *testing.T) *env {
+func setup(t *testing.T) *env { return setupWith(t, true) }
+
+func setupWith(t *testing.T, withKeys bool) *env {
 	t.Helper()
 	tmp := t.TempDir()
 	buildDir := "build/test"
@@ -84,6 +95,7 @@ func setup(t *testing.T) *env {
 	spin := buildWasm(t, "spin", buildDir+"/spin.wasm")
 	hog := buildWasm(t, "hog", buildDir+"/hog.wasm")
 	hashBytes := buildWasm(t, "hash-bytes", buildDir+"/hash-bytes.wasm")
+	cat := buildWasm(t, "cat", buildDir+"/cat.wasm")
 	primes := buildWasm(t, "primes", buildDir+"/primes.wasm")
 
 	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
@@ -93,6 +105,7 @@ func setup(t *testing.T) *env {
 	publishTo(t, regDir, priv, "spin", spin, 64, 500)
 	publishTo(t, regDir, priv, "hog", hog, 64, 20000)
 	publishTo(t, regDir, priv, "hash-bytes", hashBytes, 64, 20000)
+	publishTo(t, regDir, priv, "cat", cat, 64, 20000)
 	publishTo(t, regDir, priv, "primes", primes, 512, 60000)
 	// Same module as spin but with a long limit, to test cancelling a running job.
 	publishTo(t, regDir, priv, "spin-long", spin, 64, 30000)
@@ -106,7 +119,14 @@ func setup(t *testing.T) *env {
 	must(t, err)
 	signer, err := receipts.NewSigner()
 	must(t, err)
-	srv, err := server.New(server.Config{Tenant: "test", Registry: reg, Signer: signer, Provider: dev, DevTrust: dev.TrustKey()})
+	cfg := server.Config{Tenant: "test", Registry: reg, Signer: signer, Provider: dev, DevTrust: dev.TrustKey()}
+	var devKMS *seal.DevKMS
+	if withKeys {
+		devKMS, err = seal.LoadDevKMS(filepath.Join(tmp, "kms.key"))
+		must(t, err)
+		cfg.Keys = devKMS
+	}
+	srv, err := server.New(cfg)
 	must(t, err)
 
 	ctx := context.Background()
@@ -116,7 +136,7 @@ func setup(t *testing.T) *env {
 	sess, err := mcp.NewClient(&mcp.Implementation{Name: "test"}, nil).Connect(ctx, t2, nil)
 	must(t, err)
 	t.Cleanup(func() { sess.Close() })
-	return &env{dir: regDir, pubKey: pub, privKey: priv, session: sess, devTrust: dev.TrustKey(), measure: "test-measurement", statsWasm: stats}
+	return &env{srv: srv, kms: devKMS, dir: regDir, pubKey: pub, privKey: priv, session: sess, devTrust: dev.TrustKey(), measure: "test-measurement", statsWasm: stats}
 }
 
 func (e *env) execute(t *testing.T, args map[string]any) (*mcp.CallToolResult, map[string]any) {
@@ -465,5 +485,310 @@ func TestReplayTool(t *testing.T) {
 	must(t, json.Unmarshal(raw, &other))
 	if res, _ := e.call(t, "replay", map[string]any{"receipt_bundle": other, "input": csvData}); !res.IsError {
 		t.Fatal("replaying an unknown workload should be an error")
+	}
+}
+
+// ---- confidential data path ----
+
+type owner struct {
+	priv *ecdh.PrivateKey
+}
+
+func newOwner(t *testing.T) owner {
+	t.Helper()
+	k, err := ecdh.X25519().GenerateKey(rand.Reader)
+	must(t, err)
+	return owner{k}
+}
+
+// seal encrypts plaintext for one exact job, as `trustgate seal` does.
+func (o owner) seal(t *testing.T, e *env, workload string, args []string, plaintext []byte) (*seal.SealedInput, []byte) {
+	t.Helper()
+	dk, wrapped, err := e.kms.GenerateDataKey()
+	must(t, err)
+	sha := workloadSHA(t, e, workload)
+	env, salt, err := seal.SealInput(dk, wrapped, sha, args, o.priv.PublicKey().Bytes(), plaintext)
+	must(t, err)
+	return env, salt
+}
+
+func workloadSHA(t *testing.T, e *env, name string) string {
+	t.Helper()
+	_, out := e.call(t, "list_workloads", map[string]any{})
+	for _, w := range out["workloads"].([]any) {
+		m := w.(map[string]any)
+		if m["name"] == name {
+			return m["sha256"].(string)
+		}
+	}
+	t.Fatalf("workload %s not found", name)
+	return ""
+}
+
+func asMap(t *testing.T, v any) map[string]any {
+	t.Helper()
+	raw, err := json.Marshal(v)
+	must(t, err)
+	var m map[string]any
+	must(t, json.Unmarshal(raw, &m))
+	return m
+}
+
+func (o owner) open(t *testing.T, out map[string]any) *seal.OutputPayload {
+	t.Helper()
+	var so seal.SealedOutput
+	must(t, json.Unmarshal(mustJSON(t, out["sealed_output"]), &so))
+	b := bundleOf(t, out)
+	p, err := seal.OpenOutput(o.priv.Bytes(), &so, b.Receipt.Confidential.InputCiphertextSHA256)
+	must(t, err)
+	return p
+}
+
+func mustJSON(t *testing.T, v any) []byte {
+	t.Helper()
+	raw, err := json.Marshal(v)
+	must(t, err)
+	return raw
+}
+
+func TestConfidentialJob(t *testing.T) {
+	e := setup(t)
+	o := newOwner(t)
+	plaintext := []byte(csvData)
+	args := []string{"amount", "supplier"}
+	env, salt := o.seal(t, e, "csv-stats", args, plaintext)
+
+	res, out := e.call(t, "execute", map[string]any{"workload": "csv-stats", "args": args, "sealed_input": asMap(t, env)})
+	if res.IsError {
+		t.Fatalf("sealed execute failed: %+v", res.Content)
+	}
+	if out["output"] != "" || out["stderr"] != nil && out["stderr"] != "" || out["sealed_output"] == nil {
+		t.Fatalf("a confidential job must not return plaintext output: %+v", out)
+	}
+	p := o.open(t, out)
+	if !strings.Contains(string(p.Stdout), `"anomalies":[{"row":14`) {
+		t.Fatalf("decrypted result is wrong: %s", p.Stdout)
+	}
+
+	// Same job in the clear gives the same bytes, so sealing changes nothing.
+	_, clear := e.execute(t, map[string]any{"workload": "csv-stats", "input": csvData, "args": args})
+	if clear["output"].(string) != string(p.Stdout) {
+		t.Fatal("sealed and plain execution disagree")
+	}
+
+	b := bundleOf(t, out)
+	if !verify.OK(verify.Bundle(b, e.opts())) {
+		t.Fatal("confidential receipt does not verify")
+	}
+	// Commitments are salted: not the plain hash of the data.
+	if b.Receipt.OutputSHA256 == canon.SHA256(p.Stdout) || b.Receipt.Inputs[0].SHA256 == canon.SHA256(plaintext) {
+		t.Fatal("confidential receipt exposes plain, brute-forceable hashes")
+	}
+	// The data owner can replay with the salts; nobody else can.
+	if cs := verify.ReplaySalted(context.Background(), b, e.statsWasm, plaintext, salt, p.Salt); !verify.OK(cs) {
+		t.Fatalf("owner replay failed: %+v", cs)
+	}
+	if verify.OK(verify.Replay(context.Background(), b, e.statsWasm, plaintext)) {
+		t.Fatal("replay without salts should not succeed")
+	}
+	if verify.OK(verify.ReplaySalted(context.Background(), b, e.statsWasm, plaintext, salt, make([]byte, 32))) {
+		t.Fatal("replay with a wrong salt should not succeed")
+	}
+	// The server refuses to replay confidential receipts itself.
+	if res, _ := e.call(t, "replay", map[string]any{"receipt_bundle": out["receipt_bundle"], "input": csvData}); !res.IsError {
+		t.Fatal("server-side replay of a confidential receipt should be refused")
+	}
+}
+
+// recorder captures every byte that crosses the (untrusted) network path.
+type recorder struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (r *recorder) write(b []byte) { r.mu.Lock(); r.buf.Write(b); r.mu.Unlock() }
+
+type recordingTransport struct{ r *recorder }
+
+func (rt recordingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.Body != nil {
+		body, _ := io.ReadAll(req.Body)
+		rt.r.write(body)
+		req.Body = io.NopCloser(bytes.NewReader(body))
+	}
+	resp, err := http.DefaultTransport.RoundTrip(req)
+	if err != nil {
+		return nil, err
+	}
+	resp.Body = io.NopCloser(io.TeeReader(resp.Body, writerFunc(rt.r.write)))
+	return resp, nil
+}
+
+type writerFunc func([]byte)
+
+func (f writerFunc) Write(b []byte) (int, error) { f(b); return len(b), nil }
+
+func TestConfidentialNothingInTheClearOnTheWire(t *testing.T) {
+	e := setup(t)
+	o := newOwner(t)
+	args := []string{"amount", "supplier"}
+	env, _ := o.seal(t, e, "csv-stats", args, []byte(csvData))
+
+	ts := httptest.NewServer(e.srv.Handler())
+	defer ts.Close()
+	rec := &recorder{}
+	ctx := context.Background()
+	sess, err := mcp.NewClient(&mcp.Implementation{Name: "wire"}, nil).Connect(ctx, &mcp.StreamableClientTransport{
+		Endpoint: ts.URL + "/mcp", HTTPClient: &http.Client{Transport: recordingTransport{rec}},
+	}, nil)
+	must(t, err)
+	defer sess.Close()
+	res, err := sess.CallTool(ctx, &mcp.CallToolParams{Name: "execute", Arguments: map[string]any{"workload": "csv-stats", "args": args, "sealed_input": asMap(t, env)}})
+	must(t, err)
+	if res.IsError {
+		t.Fatalf("execute failed: %+v", res.Content)
+	}
+	out, _ := res.StructuredContent.(map[string]any)
+	if got := o.open(t, out); len(got.Stdout) == 0 {
+		t.Fatal("owner could not read the result")
+	}
+
+	// Positive control: the same job sent unsealed MUST show plaintext on the
+	// recorded wire, otherwise this test would pass while observing nothing.
+	ctl := &recorder{}
+	sess2, err := mcp.NewClient(&mcp.Implementation{Name: "wire-control"}, nil).Connect(ctx, &mcp.StreamableClientTransport{
+		Endpoint: ts.URL + "/mcp", HTTPClient: &http.Client{Transport: recordingTransport{ctl}},
+	}, nil)
+	must(t, err)
+	defer sess2.Close()
+	if _, err := sess2.CallTool(ctx, &mcp.CallToolParams{Name: "execute", Arguments: map[string]any{"workload": "csv-stats", "args": args, "input": csvData}}); err != nil {
+		t.Fatal(err)
+	}
+	// Fragments are long enough that they cannot appear by chance in random
+	// base64 ciphertext, and contain no quotes (the workload's JSON is escaped
+	// inside the MCP message).
+	fragments := []string{"acme", "beta", "100000", "anomalies", "stddev", "groups"}
+	for _, visible := range fragments {
+		if !strings.Contains(ctl.buf.String(), visible) {
+			t.Fatalf("positive control failed: %q not seen on the wire of an unsealed job, so the recorder is not capturing traffic", visible)
+		}
+	}
+
+	wire := rec.buf.String()
+	if len(wire) < 500 {
+		t.Fatalf("recorded suspiciously little traffic (%d bytes); the test is not observing the wire", len(wire))
+	}
+	// Input values and result values must not appear anywhere on the wire.
+	// (The column names in args are visible on purpose: arguments are public,
+	// authenticated job parameters. Sensitive parameters belong in the sealed input.)
+	for _, secret := range fragments {
+		if strings.Contains(wire, secret) {
+			t.Errorf("plaintext fragment %q crossed the wire", secret)
+		}
+	}
+}
+
+func TestConfidentialParentAttacks(t *testing.T) {
+	e := setup(t)
+	o := newOwner(t)
+	args := []string{"amount", "supplier"}
+	env, _ := o.seal(t, e, "csv-stats", args, []byte(csvData))
+	good := func() map[string]any {
+		return map[string]any{"workload": "csv-stats", "args": args, "sealed_input": asMap(t, env)}
+	}
+	expectFail := func(name string, in map[string]any) {
+		t.Helper()
+		res, out := e.call(t, "execute", in)
+		if !res.IsError {
+			t.Errorf("%s: the attack succeeded", name)
+			return
+		}
+		if out != nil && out["sealed_output"] != nil {
+			t.Errorf("%s: a sealed output was produced", name)
+		}
+	}
+
+	// The hostile parent has the ciphertext and can call execute itself.
+	in := good()
+	in["workload"] = "cat" // an approved workload that just echoes stdin
+	expectFail("point ciphertext at an echo workload", in)
+
+	in = good()
+	in["args"] = []string{"amount"}
+	expectFail("change the arguments", in)
+
+	attacker := newOwner(t)
+	swapped := *env
+	swapped.RecipientPub = hex.EncodeToString(attacker.priv.PublicKey().Bytes())
+	in = good()
+	in["sealed_input"] = asMap(t, &swapped)
+	expectFail("swap in the attacker's result key", in)
+
+	tampered := *env
+	raw, _ := base64.StdEncoding.DecodeString(tampered.Ciphertext)
+	raw[len(raw)-1] ^= 1
+	tampered.Ciphertext = base64.StdEncoding.EncodeToString(raw)
+	in = good()
+	in["sealed_input"] = asMap(t, &tampered)
+	expectFail("flip a ciphertext bit", in)
+
+	// Data wrapped by a different KMS (a key the enclave cannot unwrap).
+	other, err := seal.LoadDevKMS(filepath.Join(t.TempDir(), "other.key"))
+	must(t, err)
+	dk, wrapped, _ := other.GenerateDataKey()
+	foreign, _, err := seal.SealInput(dk, wrapped, workloadSHA(t, e, "csv-stats"), args, o.priv.PublicKey().Bytes(), []byte(csvData))
+	must(t, err)
+	in = good()
+	in["sealed_input"] = asMap(t, foreign)
+	expectFail("data key from a KMS the enclave cannot use", in)
+
+	in = good()
+	in["input"] = "x"
+	expectFail("plaintext input together with sealed input", in)
+
+	// Even the legitimate attacker view: the parent can run the job again, but
+	// only the owner's key can read what comes back.
+	res, out := e.call(t, "execute", good())
+	if res.IsError {
+		t.Fatalf("a replayed legitimate request should still work: %+v", res.Content)
+	}
+	var so seal.SealedOutput
+	must(t, json.Unmarshal(mustJSON(t, out["sealed_output"]), &so))
+	b := bundleOf(t, out)
+	if _, err := seal.OpenOutput(attacker.priv.Bytes(), &so, b.Receipt.Confidential.InputCiphertextSHA256); err == nil {
+		t.Fatal("the attacker read a result sealed to someone else")
+	}
+}
+
+func TestConfidentialDisabledWithoutKeys(t *testing.T) {
+	e := setupWith(t, false)
+	o := newOwner(t)
+	// Seal with a throwaway KMS; the server has none configured at all.
+	tmp, err := seal.LoadDevKMS(filepath.Join(t.TempDir(), "k.key"))
+	must(t, err)
+	dk, wrapped, _ := tmp.GenerateDataKey()
+	env, _, err := seal.SealInput(dk, wrapped, workloadSHA(t, e, "csv-stats"), []string{"amount"}, o.priv.PublicKey().Bytes(), []byte(csvData))
+	must(t, err)
+	res, _ := e.call(t, "execute", map[string]any{"workload": "csv-stats", "args": []string{"amount"}, "sealed_input": asMap(t, env)})
+	if !res.IsError {
+		t.Fatal("sealed jobs must be refused when the server has no key provider")
+	}
+}
+
+func TestConfidentialAsyncJob(t *testing.T) {
+	e := setup(t)
+	o := newOwner(t)
+	env, _ := o.seal(t, e, "hash-bytes", nil, []byte("async secret"))
+	_, job := e.call(t, "execute_async", map[string]any{"workload": "hash-bytes", "sealed_input": asMap(t, env)})
+	id := job["job_id"].(string)
+	waitJob(t, e, id, "succeeded")
+	_, r := e.call(t, "job_result", map[string]any{"job_id": id})
+	result := r["result"].(map[string]any)
+	if result["output"] != "" || result["sealed_output"] == nil {
+		t.Fatalf("async confidential job leaked plaintext: %+v", result)
+	}
+	sum := sha256.Sum256([]byte("async secret"))
+	if p := o.open(t, result); !strings.Contains(string(p.Stdout), hex.EncodeToString(sum[:])) {
+		t.Fatalf("wrong decrypted result: %s", p.Stdout)
 	}
 }

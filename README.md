@@ -12,9 +12,10 @@ Two modes, same code:
 - **`-mode nitro`**: runs inside an AWS Nitro Enclave. Verified on real hardware:
   - the receipt-signing key is bound to a real Nitro attestation document that verifies against the AWS root CA;
   - edited receipts, changed inputs and wrong pinned measurements fail verification;
-  - AWS KMS releases a secret only to the enclave with the exact measured image; the parent instance's own credentials and a modified image are both denied.
+  - AWS KMS releases a secret only to the enclave with the exact measured image; the parent instance's own credentials and a modified image are both denied;
+  - confidential jobs: an input sealed by a separate data-owner identity is unwrapped only by the attested enclave and the result comes back sealed. A packet capture on the parent instance of a sealed job contained none of the data or results, while the same job unsealed did; and a hostile parent that re-targets the ciphertext at another approved workload is refused.
 
-Known gaps: builds are not reproducible yet (every rebuild changes PCR0, so the KMS key policy must be updated), transport to the MCP endpoint is plain HTTP, and the confidential path is verified in tests and dev mode but not yet run against real KMS on hardware (see `.agent/setup.md` B12).
+Known gaps: builds are not reproducible yet (every rebuild changes PCR0, so the KMS key policy must be updated), transport to the MCP endpoint is plain HTTP.
 
 TrustGate proves what code ran on which input in which environment. It does not prove the result is correct.
 

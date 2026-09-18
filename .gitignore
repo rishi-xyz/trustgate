@@ -8,3 +8,15 @@ build/
 # generated locally by `make publish` / demos
 registry/manifests/
 receipt.json
+
+# outputs and secrets from running jobs (never commit)
+recipient.key
+*.salts.json
+*.meta
+sealed.json
+conf*.json
+blob.json
+async.json
+plain*.json
+evil.json
+receipt.json

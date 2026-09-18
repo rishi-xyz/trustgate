@@ -6,7 +6,17 @@ Attested compute for AI agents. An MCP agent submits an approved WebAssembly wor
 
 ## Status
 
-Working locally in **insecure dev mode** (software attestation, no hardware isolation). AWS Nitro Enclave mode (`-mode nitro`) is implemented but not yet exercised on real hardware.
+Two modes, same code:
+
+- **`-mode dev`**: local, software attestation, no hardware isolation. Insecure by design; receipts are labelled `dev` and the verifier rejects them unless `-allow-dev` is passed.
+- **`-mode nitro`**: runs inside an AWS Nitro Enclave. Verified on real hardware:
+  - the receipt-signing key is bound to a real Nitro attestation document that verifies against the AWS root CA;
+  - edited receipts, changed inputs and wrong pinned measurements fail verification;
+  - AWS KMS releases a secret only to the enclave with the exact measured image; the parent instance's own credentials and a modified image are both denied.
+
+Known gaps: builds are not reproducible yet (every rebuild changes PCR0, so the KMS key policy must be updated), transport to the MCP endpoint is plain HTTP, and encrypted job inputs are not yet wired into `execute`.
+
+TrustGate proves what code ran on which input in which environment. It does not prove the result is correct.
 
 ## Quick start (local)
 
@@ -26,4 +36,7 @@ See `.agent/setup.md` for MCP client setup and the AWS steps.
 - `internal/receipts` canonical, hash-chained, Ed25519-signed receipts
 - `internal/attest` dev and Nitro attestation providers and verification
 - `workloads/` sample workloads (compiled to `wasip1`)
+- `internal/kms`, `internal/control` attested KMS decrypt and the enclave control channel
+- `cmd/vsock-forwarder`, `cmd/trustgate-parent` parent-side helpers for Nitro
+- `Dockerfile.nitro` enclave image (registry and publisher key baked in, so they are part of the measurement)
 - `tests/` end-to-end and attack tests

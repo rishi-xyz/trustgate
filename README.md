@@ -14,7 +14,7 @@ Two modes, same code:
   - edited receipts, changed inputs and wrong pinned measurements fail verification;
   - AWS KMS releases a secret only to the enclave with the exact measured image; the parent instance's own credentials and a modified image are both denied.
 
-Known gaps: builds are not reproducible yet (every rebuild changes PCR0, so the KMS key policy must be updated), transport to the MCP endpoint is plain HTTP, and encrypted job inputs are not yet wired into `execute`.
+Known gaps: builds are not reproducible yet (every rebuild changes PCR0, so the KMS key policy must be updated), transport to the MCP endpoint is plain HTTP, and the confidential path is verified in tests and dev mode but not yet run against real KMS on hardware (see `.agent/setup.md` B12).
 
 TrustGate proves what code ran on which input in which environment. It does not prove the result is correct.
 
@@ -25,8 +25,21 @@ TrustGate proves what code ran on which input in which environment. It does not 
 | `execute` | Run an approved workload; input as text (`input`) or raw bytes (`input_b64`); returns output plus a signed receipt bundle |
 | `execute_async`, `job_status`, `job_result`, `cancel_job` | Long-running jobs: get a `job_id` immediately, poll, fetch the result, or cancel. Plain tools rather than the MCP Tasks extension (the Go SDK has no Tasks support yet) |
 | `replay` | Re-run the workload in a receipt against the original input and compare the output hash (same server; replay on your own machine for independent evidence) |
+| `execute` with `sealed_input` | **Confidential job**: input encrypted by the data owner, unwrapped only by the attested enclave, result sealed to the owner's key. See below |
 | `verify_receipt` | Check signature, attestation, key binding and an optional pinned measurement |
 | `list_workloads`, `get_attestation` | Discover approved workloads and the server's attestation evidence |
+
+## Confidential jobs
+
+The data owner runs `trustgate seal`, which encrypts the input with a fresh data key (wrapped by KMS) and binds the ciphertext to one exact job: workload hash, arguments and the public key that may read the result. The enclave unwraps the data key with an attested KMS call, runs the job, and returns the output sealed to that key.
+
+- The parent instance, the network and the forwarder only handle ciphertext.
+- A hostile parent cannot point the ciphertext at a different approved workload, change the arguments, or redirect the result to its own key; each fails authentication.
+- Receipt hashes for confidential jobs are salted with secrets only the owner holds, so small or guessable data cannot be brute-forced from the receipt. The owner replays with `trustgate replay -salts`.
+- Arguments are authenticated but **not secret**. Put sensitive parameters in the sealed input.
+- The parent still sees metadata: timing, sizes, which workload and arguments, and can delay or drop jobs.
+
+Locally (`-mode dev`) a local key stands in for KMS; `make demo` shows the whole flow. On Nitro the data key is unwrapped by real KMS, gated by the enclave's measurement.
 
 ## Quick start (local)
 

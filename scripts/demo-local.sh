@@ -31,6 +31,21 @@ echo; echo "== async long-running job (primes below 60M), polled until done"
 bin/trustgate exec -async -url "http://localhost:$PORT/mcp" -workload primes -args 60000000 -out .trustgate-dev/async-receipt.json
 bin/trustgate verify .trustgate-dev/async-receipt.json $V | tail -2
 
+echo; echo "== confidential job: input sealed by the data owner, result sealed to the owner's key"
+D=.trustgate-dev
+bin/trustgate seal -url "http://localhost:$PORT/mcp" -workload csv-stats -args amount,supplier \
+  -input testdata/transactions.csv -out $D/sealed.json -recipient $D/recipient.key -kms dev -dev-dir $D
+echo "what an untrusted parent can see of the input:"; head -c 240 $D/sealed.json; echo " ..."
+bin/trustgate exec -url "http://localhost:$PORT/mcp" -workload csv-stats -sealed $D/sealed.json -out $D/conf-receipt.json
+echo; echo "-- verify the confidential receipt"
+bin/trustgate verify $D/conf-receipt.json $V | tail -2
+echo "-- owner replays with the secret salts"
+bin/trustgate replay $D/conf-receipt.json $V -salts $D/conf-receipt.json.salts.json -wasm build/csv-stats.wasm -stdin testdata/transactions.csv | tail -3
+echo "-- attack: replay without the salts (what the parent would have)"
+bin/trustgate replay $D/conf-receipt.json $V -wasm build/csv-stats.wasm -stdin testdata/transactions.csv && { echo "UNEXPECTED PASS"; exit 1; } || echo "(failed as expected)"
+echo "-- attack: parent points the sealed input at a different approved workload"
+bin/trustgate exec -url "http://localhost:$PORT/mcp" -workload hash-bytes -sealed $D/sealed.json -out $D/evil-receipt.json && { echo "UNEXPECTED PASS"; exit 1; } || echo "(refused as expected)"
+
 echo; echo "== attack: flip one input byte, replay must fail"
 sed 's/50000.00/50000.01/' testdata/transactions.csv >.trustgate-dev/tampered.csv
 bin/trustgate replay .trustgate-dev/receipt.json $V -wasm build/csv-stats.wasm -stdin .trustgate-dev/tampered.csv && { echo "UNEXPECTED PASS"; exit 1; } || echo "(failed as expected)"

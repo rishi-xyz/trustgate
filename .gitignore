@@ -20,3 +20,7 @@ async.json
 plain*.json
 evil.json
 receipt.json
+
+# per-machine client config (contains endpoint addresses)
+opencode.json
+.mcp.json

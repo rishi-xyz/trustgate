@@ -34,6 +34,8 @@ func main() {
 		keygen(os.Args[2:])
 	case "publish":
 		publish(os.Args[2:])
+	case "seal":
+		sealCmd(os.Args[2:])
 	case "exec":
 		execCmd(os.Args[2:])
 	case "verify":
@@ -46,7 +48,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: trustgate keygen|publish|exec|verify|replay [flags]")
+	fmt.Fprintln(os.Stderr, "usage: trustgate keygen|publish|seal|exec|verify|replay [flags]")
 	os.Exit(2)
 }
 
@@ -150,6 +152,7 @@ func verifyCmd(args []string, replay bool) int {
 	measurement := fs.String("measurement", "", "expected enclave measurement (hex PCR0 / dev binary hash)")
 	wasmPath := fs.String("wasm", "", "replay: workload .wasm to re-run")
 	stdinPath := fs.String("stdin", "", "replay: input file used originally")
+	saltsPath := fs.String("salts", "", "replay of a confidential receipt: JSON file with salt_in and salt_out (written by `exec -sealed`)")
 	// Allow the bundle path before or after flags.
 	var bundlePath string
 	if len(args) > 0 && len(args[0]) > 0 && args[0][0] != '-' {
@@ -186,7 +189,26 @@ func verifyCmd(args []string, replay bool) int {
 		if err != nil {
 			die("%v", err)
 		}
-		checks = append(checks, verify.Replay(context.Background(), b, wasm, stdin)...)
+		var saltIn, saltOut []byte
+		if *saltsPath != "" {
+			raw, err := os.ReadFile(*saltsPath)
+			if err != nil {
+				die("%v", err)
+			}
+			var sj struct{ In, Out string }
+			var tmp map[string]string
+			if err := json.Unmarshal(raw, &tmp); err != nil {
+				die("bad salts file: %v", err)
+			}
+			sj.In, sj.Out = tmp["salt_in"], tmp["salt_out"]
+			if saltIn, err = hex.DecodeString(sj.In); err != nil {
+				die("bad salt_in")
+			}
+			if saltOut, err = hex.DecodeString(sj.Out); err != nil {
+				die("bad salt_out")
+			}
+		}
+		checks = append(checks, verify.ReplaySalted(context.Background(), b, wasm, stdin, saltIn, saltOut)...)
 	}
 
 	for _, c := range checks {

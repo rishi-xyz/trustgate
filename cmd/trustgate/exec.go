@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -32,7 +33,13 @@ func call(ctx context.Context, sess *mcp.ClientSession, name string, args map[st
 	}
 	m, _ := res.StructuredContent.(map[string]any)
 	if m == nil {
-		die("%s: no structured result: %+v", name, res.Content)
+		var msgs []string
+		for _, c := range res.Content {
+			if t, ok := c.(*mcp.TextContent); ok {
+				msgs = append(msgs, t.Text)
+			}
+		}
+		die("%s: %s", name, strings.Join(msgs, "; "))
 	}
 	return m, res
 }
@@ -49,6 +56,8 @@ func execCmd(args []string) {
 	inputFile := fs.String("input", "", "file whose bytes are sent as stdin (binary is fine)")
 	argList := fs.String("args", "", "comma-separated workload arguments")
 	out := fs.String("out", "receipt.json", "where to save the receipt bundle")
+	sealed := fs.String("sealed", "", "sealed input file from `trustgate seal` (confidential job)")
+	recipient := fs.String("recipient", "", "recipient private key to decrypt a sealed result (default: from the .meta sidecar)")
 	async := fs.Bool("async", false, "run as an async job and poll until it finishes")
 	poll := fs.Duration("poll", 500*time.Millisecond, "async: polling interval")
 	_ = fs.Parse(args)
@@ -56,6 +65,30 @@ func execCmd(args []string) {
 		die("-workload is required")
 	}
 	callArgs := map[string]any{"workload": *workload}
+	var meta sealMeta
+	if *sealed != "" {
+		if *inputFile != "" {
+			die("-sealed and -input are mutually exclusive")
+		}
+		raw, err := os.ReadFile(*sealed)
+		if err != nil {
+			die("%v", err)
+		}
+		var env map[string]any
+		if err := json.Unmarshal(raw, &env); err != nil {
+			die("bad sealed file: %v", err)
+		}
+		callArgs["sealed_input"] = env
+		if mraw, err := os.ReadFile(*sealed + ".meta"); err == nil {
+			_ = json.Unmarshal(mraw, &meta)
+			if *argList == "" && len(meta.Args) > 0 {
+				*argList = strings.Join(meta.Args, ",")
+			}
+			if *recipient == "" {
+				*recipient = meta.RecipientKey
+			}
+		}
+	}
 	if *inputFile != "" {
 		b, err := os.ReadFile(*inputFile)
 		if err != nil {
@@ -111,9 +144,13 @@ func execCmd(args []string) {
 		failed = res.IsError
 	}
 
-	fmt.Printf("status: %v\n%v\n", m["status"], m["output"])
-	if s, _ := m["stderr"].(string); s != "" {
-		fmt.Printf("stderr: %s\n", s)
+	if so, ok := m["sealed_output"]; ok {
+		showSealed(m, so, *recipient, meta, *out)
+	} else {
+		fmt.Printf("status: %v\n%v\n", m["status"], m["output"])
+		if s, _ := m["stderr"].(string); s != "" {
+			fmt.Printf("stderr: %s\n", s)
+		}
 	}
 	raw, _ := json.MarshalIndent(m["receipt_bundle"], "", "  ")
 	if err := os.WriteFile(*out, raw, 0o644); err != nil {
@@ -122,5 +159,28 @@ func execCmd(args []string) {
 	fmt.Printf("receipt saved to %s\n", *out)
 	if failed {
 		os.Exit(1)
+	}
+}
+
+// showSealed decrypts a confidential result and writes the salts needed to
+// check the receipt's commitments later (kept private by the data owner).
+func showSealed(m map[string]any, so any, recipientKey string, meta sealMeta, out string) {
+	fmt.Printf("status: %v\n(result is sealed: the server and any relay only saw ciphertext)\n", m["status"])
+	if recipientKey == "" {
+		fmt.Println("no -recipient key given: cannot decrypt")
+		return
+	}
+	bundle, _ := m["receipt_bundle"].(map[string]any)
+	rec, _ := bundle["receipt"].(map[string]any)
+	conf, _ := rec["confidential"].(map[string]any)
+	ctSHA, _ := conf["input_ciphertext_sha256"].(string)
+	p, err := openSealedOutput(so, recipientKey, ctSHA)
+	if err != nil {
+		die("decrypt result: %v", err)
+	}
+	fmt.Printf("decrypted result:\n%s", p.Stdout)
+	salts, _ := json.MarshalIndent(map[string]string{"salt_in": meta.SaltIn, "salt_out": hex.EncodeToString(p.Salt)}, "", "  ")
+	if err := os.WriteFile(out+".salts.json", salts, 0o600); err == nil {
+		fmt.Printf("salts saved to %s.salts.json (private)\n", out)
 	}
 }

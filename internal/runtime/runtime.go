@@ -116,15 +116,24 @@ func Run(ctx context.Context, wasm, stdin []byte, args []string, lim Limits) (*R
 		}
 		// wazero reports context cancellation as a sys exit code.
 		if ctx.Err() != nil {
-			return res, fmt.Errorf("%w: timeout after %dms", ErrLimit, lim.TimeoutMS)
+			return res, ctxError(ctx, lim)
 		}
 		return res, fmt.Errorf("workload exited with code %d", exit.ExitCode())
 	}
 	if ctx.Err() != nil {
-		return res, fmt.Errorf("%w: timeout after %dms", ErrLimit, lim.TimeoutMS)
+		return res, ctxError(ctx, lim)
 	}
 	if errors.Is(err, ErrLimit) {
 		return res, err
 	}
 	return res, fmt.Errorf("execution failed: %w", err)
+}
+
+// ctxError maps a finished context to either a resource-limit error (deadline)
+// or a plain cancellation requested by the caller.
+func ctxError(ctx context.Context, lim Limits) error {
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return fmt.Errorf("%w: timeout after %dms", ErrLimit, lim.TimeoutMS)
+	}
+	return fmt.Errorf("cancelled: %w", context.Canceled)
 }

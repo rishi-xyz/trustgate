@@ -36,6 +36,17 @@ type Execution struct {
 	Error      string `json:"error,omitempty"`
 }
 
+// Confidential marks a receipt for a job whose input and output were sealed.
+// Input and output hashes in such a receipt are salted with secrets known only
+// to the data owner, so the parent cannot brute-force small or guessable data
+// from the receipt.
+type Confidential struct {
+	// InputCiphertextSHA256 identifies the exact sealed input that was processed.
+	InputCiphertextSHA256 string `json:"input_ciphertext_sha256"`
+	// RecipientPub is the X25519 key (hex) the result was sealed to.
+	RecipientPub string `json:"recipient_pub"`
+}
+
 // Receipt commits to what ran, on what, under which limits and environment.
 type Receipt struct {
 	V            int        `json:"v"`
@@ -52,6 +63,9 @@ type Receipt struct {
 	Runtime      Runtime    `json:"runtime"`
 	Limits       Limits     `json:"limits"`
 	Execution    Execution  `json:"execution"`
+	// Confidential is set for sealed jobs; input_sha256/output_sha256 are then
+	// sha256(salt||data) rather than plain hashes.
+	Confidential *Confidential `json:"confidential,omitempty"`
 	// AttestationMode is "nitro" (hardware-backed) or "dev" (software, insecure).
 	AttestationMode string `json:"attestation_mode"`
 	AttestationRef  string `json:"attestation_ref"`

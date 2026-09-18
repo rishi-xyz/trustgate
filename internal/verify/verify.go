@@ -14,6 +14,7 @@ import (
 	"trustgate/internal/canon"
 	"trustgate/internal/receipts"
 	"trustgate/internal/runtime"
+	"trustgate/internal/seal"
 )
 
 const (
@@ -106,8 +107,23 @@ func Bundle(b *receipts.Bundle, opt Options) []Check {
 // Replay re-runs the workload with the supplied wasm and stdin and compares
 // against the receipt. It is only meaningful for deterministic-v1 receipts.
 func Replay(ctx context.Context, b *receipts.Bundle, wasm, stdin []byte) []Check {
+	return ReplaySalted(ctx, b, wasm, stdin, nil, nil)
+}
+
+// ReplaySalted is Replay for confidential receipts, whose input and output
+// commitments are sha256(salt||data). saltIn and saltOut are the secrets held
+// by the data owner; they are ignored for ordinary receipts.
+func ReplaySalted(ctx context.Context, b *receipts.Bundle, wasm, stdin, saltIn, saltOut []byte) []Check {
 	var cs []Check
 	r := b.Receipt
+	hashIn, hashOut := canon.SHA256, canon.SHA256
+	if r.Confidential != nil {
+		if len(saltIn) == 0 || len(saltOut) == 0 {
+			return append(cs, Check{Name: "confidential receipt", Status: Fail, Detail: "receipt commitments are salted; supply the input and output salts (kept by the data owner)"})
+		}
+		hashIn = func(d []byte) string { return seal.SaltedSHA256(saltIn, d) }
+		hashOut = func(d []byte) string { return seal.SaltedSHA256(saltOut, d) }
+	}
 
 	if r.Runtime.Profile != runtime.ProfileDeterministicV1 {
 		return append(cs, Check{Name: "replay profile", Status: Fail, Detail: "receipt profile " + r.Runtime.Profile + " is not replayable"})
@@ -124,7 +140,7 @@ func Replay(ctx context.Context, b *receipts.Bundle, wasm, stdin []byte) []Check
 			want = in.SHA256
 		}
 	}
-	if got := canon.SHA256(stdin); got != want {
+	if got := hashIn(stdin); got != want {
 		add(&cs, "input hash", fmt.Errorf("supplied input hashes to %s, receipt says %s", got, want), "")
 		return cs
 	}
@@ -139,7 +155,7 @@ func Replay(ctx context.Context, b *receipts.Bundle, wasm, stdin []byte) []Check
 	if res != nil {
 		out = res.Stdout
 	}
-	if got := canon.SHA256(out); got != r.OutputSHA256 {
+	if got := hashOut(out); got != r.OutputSHA256 {
 		add(&cs, "replay output hash", fmt.Errorf("replay produced %s, receipt says %s", got, r.OutputSHA256), "")
 		return cs
 	}

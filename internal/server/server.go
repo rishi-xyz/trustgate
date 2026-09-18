@@ -13,6 +13,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -44,6 +45,56 @@ type Server struct {
 	cfg         Config
 	attestation []byte
 	jobs        *jobStore
+
+	// Recent receipt bundles by id, so agents can verify or replay by reference
+	// instead of re-typing a ~6 KB attestation document (which they mis-copy).
+	rmu    sync.Mutex
+	rByID  map[string]*receipts.Bundle
+	rOrder []string
+}
+
+const maxRememberedReceipts = 256
+
+func (s *Server) remember(b *receipts.Bundle) string {
+	id := fmt.Sprintf("%s-%d", b.Receipt.Epoch, b.Receipt.Seq)
+	s.rmu.Lock()
+	defer s.rmu.Unlock()
+	s.rByID[id] = b
+	s.rOrder = append(s.rOrder, id)
+	if len(s.rOrder) > maxRememberedReceipts {
+		delete(s.rByID, s.rOrder[0])
+		s.rOrder = s.rOrder[1:]
+	}
+	return id
+}
+
+// resolveBundle returns the bundle named by receipt_id, or parsed from the
+// receipt_bundle object. Exactly one must be given.
+func (s *Server) resolveBundle(bundle map[string]any, id string) (*receipts.Bundle, error) {
+	switch {
+	case id != "" && len(bundle) > 0:
+		return nil, errors.New("give either receipt_id or receipt_bundle, not both")
+	case id != "":
+		s.rmu.Lock()
+		b, ok := s.rByID[id]
+		s.rmu.Unlock()
+		if !ok {
+			return nil, fmt.Errorf("unknown or expired receipt_id %q (only the last %d receipts of this server run are kept; pass receipt_bundle instead)", id, maxRememberedReceipts)
+		}
+		return b, nil
+	case len(bundle) > 0:
+		raw, err := json.Marshal(bundle)
+		if err != nil {
+			return nil, err
+		}
+		var b receipts.Bundle
+		if err := json.Unmarshal(raw, &b); err != nil {
+			return nil, fmt.Errorf("bad bundle: %w", err)
+		}
+		return &b, nil
+	default:
+		return nil, errors.New("give receipt_id (preferred) or receipt_bundle")
+	}
 }
 
 // New creates the server and obtains the boot attestation document that binds
@@ -57,7 +108,7 @@ func New(cfg Config) (*Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("attest: %w", err)
 	}
-	s := &Server{cfg: cfg, attestation: doc}
+	s := &Server{cfg: cfg, attestation: doc, rByID: map[string]*receipts.Bundle{}}
 	s.jobs = newJobStore(s)
 	return s, nil
 }
@@ -91,10 +142,13 @@ func stdinBytes(text, b64 string) ([]byte, error) {
 }
 
 type ExecuteOutput struct {
-	Status  string         `json:"status"`
-	Output  string         `json:"output"`
-	Stderr  string         `json:"stderr,omitempty"`
-	Receipt map[string]any `json:"receipt_bundle" jsonschema:"signed receipt plus attestation; pass to verify_receipt, replay or the trustgate CLI"`
+	Status string `json:"status"`
+	Output string `json:"output"`
+	Stderr string `json:"stderr,omitempty"`
+	// ReceiptID lets verify_receipt and replay refer to this receipt without the
+	// caller re-typing the (large) bundle.
+	ReceiptID string         `json:"receipt_id" jsonschema:"short id of this receipt; pass it to verify_receipt or replay instead of the bundle"`
+	Receipt   map[string]any `json:"receipt_bundle" jsonschema:"full signed receipt plus attestation, for independent verification with the trustgate CLI; do not re-type it, use receipt_id"`
 	// SealedOutput replaces Output/Stderr for confidential jobs; only the holder
 	// of the recipient private key can read it.
 	SealedOutput *seal.SealedOutput `json:"sealed_output,omitempty"`
@@ -218,7 +272,7 @@ func (s *Server) runPrepared(ctx context.Context, p *prepared) (out ExecuteOutpu
 	if err != nil {
 		return ExecuteOutput{}, nil, err
 	}
-	out = ExecuteOutput{Status: rec.Execution.Status, Output: string(stdout), Stderr: string(stderr), Receipt: asMap}
+	out = ExecuteOutput{Status: rec.Execution.Status, Output: string(stdout), Stderr: string(stderr), ReceiptID: s.remember(bundle), Receipt: asMap}
 	if p.sealed != nil {
 		pub, _ := hex.DecodeString(p.sealed.RecipientPub)
 		so, err := seal.SealOutput(pub, seal.OutputPayload{Stdout: stdout, Salt: saltOut}, ctHash)
@@ -252,9 +306,10 @@ func (s *Server) execute(ctx context.Context, _ *mcp.CallToolRequest, in Execute
 }
 
 type ReplayInput struct {
-	Bundle   map[string]any `json:"receipt_bundle" jsonschema:"the receipt_bundle returned by execute"`
-	Input    string         `json:"input,omitempty" jsonschema:"the original UTF-8 text input (set only one of input and input_b64)"`
-	InputB64 string         `json:"input_b64,omitempty" jsonschema:"the original input as base64 bytes"`
+	ReceiptID string         `json:"receipt_id,omitempty" jsonschema:"receipt_id returned by execute (preferred)"`
+	Bundle    map[string]any `json:"receipt_bundle,omitempty" jsonschema:"the full receipt_bundle instead of receipt_id; large, so prefer receipt_id"`
+	Input     string         `json:"input,omitempty" jsonschema:"the original UTF-8 text input (set only one of input and input_b64)"`
+	InputB64  string         `json:"input_b64,omitempty" jsonschema:"the original input as base64 bytes"`
 }
 
 type ReplayOutput struct {
@@ -264,14 +319,11 @@ type ReplayOutput struct {
 }
 
 func (s *Server) replay(ctx context.Context, _ *mcp.CallToolRequest, in ReplayInput) (*mcp.CallToolResult, ReplayOutput, error) {
-	raw, err := json.Marshal(in.Bundle)
+	bp, err := s.resolveBundle(in.Bundle, in.ReceiptID)
 	if err != nil {
 		return nil, ReplayOutput{}, err
 	}
-	var b receipts.Bundle
-	if err := json.Unmarshal(raw, &b); err != nil {
-		return nil, ReplayOutput{}, fmt.Errorf("bad bundle: %w", err)
-	}
+	b := *bp
 	if b.Receipt.Confidential != nil {
 		return nil, ReplayOutput{}, errors.New("confidential receipts cannot be replayed on the server without sending it the plaintext; replay locally with `trustgate replay -salts`")
 	}
@@ -330,7 +382,8 @@ func (s *Server) getAttestation(context.Context, *mcp.CallToolRequest, Attestati
 }
 
 type VerifyInput struct {
-	Bundle              map[string]any `json:"receipt_bundle" jsonschema:"the receipt_bundle returned by execute"`
+	ReceiptID           string         `json:"receipt_id,omitempty" jsonschema:"receipt_id returned by execute (preferred)"`
+	Bundle              map[string]any `json:"receipt_bundle,omitempty" jsonschema:"the full receipt_bundle instead of receipt_id; large, so prefer receipt_id"`
 	ExpectedMeasurement string         `json:"expected_measurement,omitempty" jsonschema:"pin the enclave measurement (hex)"`
 }
 type VerifyOutput struct {
@@ -339,15 +392,11 @@ type VerifyOutput struct {
 }
 
 func (s *Server) verifyReceipt(_ context.Context, _ *mcp.CallToolRequest, in VerifyInput) (*mcp.CallToolResult, VerifyOutput, error) {
-	raw, err := json.Marshal(in.Bundle)
+	b, err := s.resolveBundle(in.Bundle, in.ReceiptID)
 	if err != nil {
 		return nil, VerifyOutput{}, err
 	}
-	var b receipts.Bundle
-	if err := json.Unmarshal(raw, &b); err != nil {
-		return nil, VerifyOutput{}, fmt.Errorf("bad bundle: %w", err)
-	}
-	cs := verify.Bundle(&b, verify.Options{
+	cs := verify.Bundle(b, verify.Options{
 		AllowDev:            s.cfg.Provider.Mode() == attest.ModeDev,
 		DevTrust:            s.cfg.DevTrust,
 		ExpectedMeasurement: in.ExpectedMeasurement,
@@ -366,10 +415,10 @@ func (s *Server) MCP() *mcp.Server {
 	mcp.AddTool(srv, &mcp.Tool{Name: "job_status", Description: "Status of an async job: queued, running, succeeded, failed or cancelled."}, s.jobs.status)
 	mcp.AddTool(srv, &mcp.Tool{Name: "job_result", Description: "Output and signed receipt bundle of a finished async job (status and no result while still running)."}, s.jobs.result)
 	mcp.AddTool(srv, &mcp.Tool{Name: "cancel_job", Description: "Cancel a queued or running async job. A cancelled job produces no receipt."}, s.jobs.cancel)
-	mcp.AddTool(srv, &mcp.Tool{Name: "replay", Description: "Re-run the workload recorded in a receipt against the original input and check that the output hash is reproduced. Only meaningful for deterministic-v1 receipts."}, s.replay)
+	mcp.AddTool(srv, &mcp.Tool{Name: "replay", Description: "Re-run the workload recorded in a receipt (by receipt_id) against the original input and check that the output hash is reproduced. Only meaningful for deterministic-v1 receipts."}, s.replay)
 	mcp.AddTool(srv, &mcp.Tool{Name: "list_workloads", Description: "List approved, publisher-signed workloads."}, s.list)
 	mcp.AddTool(srv, &mcp.Tool{Name: "get_attestation", Description: "Return this server's attestation evidence and receipt-signing key."}, s.getAttestation)
-	mcp.AddTool(srv, &mcp.Tool{Name: "verify_receipt", Description: "Verify a receipt bundle (signature, attestation, key binding, optional measurement pin)."}, s.verifyReceipt)
+	mcp.AddTool(srv, &mcp.Tool{Name: "verify_receipt", Description: "Verify a receipt by its receipt_id (returned by execute or job_result): signature, attestation, key binding and an optional pinned measurement. Pass receipt_id, not the bundle; the bundle is too large to copy reliably."}, s.verifyReceipt)
 	return srv
 }
 

@@ -24,3 +24,6 @@ receipt.json
 # per-machine client config (contains endpoint addresses)
 opencode.json
 .mcp.json
+
+# guided-demo output (contains keys, salts and receipts)
+.demo/

@@ -22,6 +22,7 @@ Builds referenced (PCR0 is the SHA-384 measurement of the whole enclave image; a
 | B | `c1d966a3dd3e17b190e2a719dc56ddad967ef94aa50e100aeee324fbe9b1e842da466a507fb2ed6a4c887f1f5f9ccb97` | section 2 |
 | B-evil (deliberately modified) | `ffcbc3320ef1edb0ae85a9ac36fe9a39a863dce3d60322489155749eb32c42b9b995c516d1969520aa71e5c514bec594` | section 2 |
 | C | `92de20fec5a521505d849c92cc4827e3ceb9c68bec6d09e98eedc1d50b3e224d09a34afb905822e6ac042bfe6607d2a4` | section 3 |
+| D | `1321d0d4652b0c26ee5a51f3aa11b7f6584e780e23fa2a658a75d6c16c1992efe53bcba047e188f9cda6d7a01c8e74db` | section 6 |
 
 The same source produces a different PCR0 on each rebuild (builds are not reproducible yet), which is why each section pins its own build.
 
@@ -311,13 +312,82 @@ The same rejection applies to changed arguments, a swapped result-recipient key,
 | Core flow | `TestExecuteVerifyReplay`, `TestChainAndDeterminism`, `TestVerifyReceiptTool` |
 | Tamper and forgery | `TestAttackTamperedReceipt`, `TestAttackForgedSignerKey`, `TestAttackChangedInputReplay`, `TestAttackTamperedWasmReplay`, `TestRegistryRejects` |
 | Resource limits | `TestLimits` (timeout and memory limits fail closed) |
-| Binary input, async, replay | `TestBinaryInput`, `TestAsyncJob`, `TestAsyncFailureKeepsReceipt`, `TestCancelJob`, `TestReplayTool` |
+| Binary input, async, replay | `TestBinaryInput`, `TestAsyncJob`, `TestAsyncFailureKeepsReceipt`, `TestCancelJob`, `TestReplayTool`, `TestReceiptByID` |
 | Confidential path | `TestConfidentialJob`, `TestConfidentialNothingInTheClearOnTheWire` (with a positive control), `TestConfidentialParentAttacks`, `TestConfidentialDisabledWithoutKeys`, `TestConfidentialAsyncJob` |
 | Crypto and encodings | seal/unseal round trips and binding tests, CMS/BER decryption checked against OpenSSL |
 
 The suite also passed under the Go race detector for the async and confidential tests.
 
-## 5. What this shows, and what it does not
+## 6. Real agent clients calling the real enclave (build D)
+
+Claude Code 2.1.278 and opencode 1.18.31 were connected to the enclave's MCP endpoint, and asked in plain language to inspect the attestation, run a workload, and verify the receipt, pinned to the enclave's PCR0.
+
+Setup used:
+
+```
+$ claude mcp add --transport http trustgate-enclave http://<INSTANCE_IP>:8443/mcp
+```
+
+```json
+{ "mcp": { "trustgate-enclave": { "type": "remote", "url": "http://<INSTANCE_IP>:8443/mcp", "enabled": true } } }
+```
+
+Prompt given to both (the CSV has 13 rows with one large outlier):
+
+> Use only the trustgate-enclave MCP tools. (1) Call get_attestation and tell me the mode and measurement. (2) Run the csv-stats workload on this CSV with args value and group: [CSV]. Report the per-group sums and any anomaly rows. (3) Call verify_receipt with the receipt_id from step 2 and expected_measurement set to 1321d0d4…92efe53bcba047e188f9cda6d7a01c8e74db. State precisely whether every check passed, what kind of attestation was used, and whether the measurement matched. Be brief.
+
+### Claude Code
+
+```
+**1. Attestation:** the mode is `nitro`. The measurement is `1321d0d4652b0c26ee5a51f3aa11b7f6584e780e23fa2a658a75d6c16c1992efe53bcba047e188f9cda6d7a01c8e74db`.
+
+**2. csv-stats:** I ran it as `csv-stats@1` with args `value` and `group`. The run succeeded and the receipt_id is `boot-b6aa5f7c-1`.
+- **Per-group sums:** a = 64, b = 66, c = 5000.
+- **Anomaly:** row 14 (the `c,5000` row), z ≈ 3.46. It is the only one flagged.
+- **Overall:** count 13, sum 5130, mean ≈ 394.6, min 9, max 5000.
+
+**3. verify_receipt:** `verified: true`, and all 5 checks passed:
+- receipt signature
+- attestation reference
+- attestation document
+- signing key binding
+- enclave measurement
+
+The attestation was a real AWS Nitro one (`nitro attestation verified`), not a local or simulated one. The measurement matched the value you pinned exactly.
+
+The receipt shows what code ran on what input in that enclave. It does not show that the result is semantically correct.
+```
+
+### opencode (default model `big-pickle`)
+
+```
+> build · big-pickle
+⚙ trustgate-enclave_get_attestation
+⚙ trustgate-enclave_list_workloads
+Mode: **nitro**. Measurement: `1321d0d4652b0c26ee5a51f3aa11b7f6584e780e23fa2a658a75d6c16c1992efe53bcba047e188f9cda6d7a01c8e74db`.
+⚙ trustgate-enclave_execute {"workload":"csv-stats","args":["value","group"],"input":"group,value\na,10\n[...]\nc,5000"}
+⚙ trustgate-enclave_verify_receipt {"receipt_id":"boot-b6aa5f7c-2","expected_measurement":"1321d0d4…92efe53bcba047e188f9cda6d7a01c8e74db"}
+**1. Attestation:** mode `nitro`, measurement `1321d0d4…c8e74db`.
+**2. csv-stats (`value`/`group`):** per-group sums — `a: 64`, `b: 66`, `c: 5000`. One anomaly: row 14, value `5000`, z = 3.464 (outlier in group `c`).
+**3. Verify (`boot-b6aa5f7c-2`):** all 5 checks passed — receipt signature, attestation reference, attestation document (AWS **Nitro** attestation), signing-key binding, and pinned enclave measurement. Measurement **matched** exactly; `verified: true`.
+```
+
+### A failure this testing found, and the fix
+
+The first run against the enclave (build C) did **not** complete verification. The agent got the correct result, then had to pass the whole receipt bundle to `verify_receipt`. A real Nitro attestation document is about 6 KB of base64 and the agent mis-copied it:
+
+```
+(3) verify_receipt: I could not complete it, so I can't say whether the checks passed.
+- What happened: both attempts failed with `bad bundle: illegal base64 data at input byte 6024`.
+```
+
+The agent said so plainly instead of claiming success. The fix was server-side: `execute` and async jobs now return a short `receipt_id`, and `verify_receipt` and `replay` accept it instead of the full bundle (the bundle is still returned for independent verification). After the fix, both clients complete the flow above.
+
+### Caveat on what these agent runs prove
+
+`verify_receipt` called by an agent runs **on the same server** that produced the receipt, so it is a convenience check, not independent evidence. Independent verification is the CLI on a machine you control (sections 1 to 3), which checks the attestation against the AWS root CA itself.
+
+## 7. What this shows, and what it does not
 
 **Shown:**
 - A workload's identity, input and output are committed in a signed receipt, and the signing key is bound to a real Nitro attestation document that anyone can verify against the AWS root.

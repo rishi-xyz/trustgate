@@ -1,13 +1,18 @@
 .PHONY: build wasm publish test run-dev demo clean
 
 build:
-	mkdir -p bin && CGO_ENABLED=0 go build -o bin/ ./cmd/...
+	mkdir -p bin && CGO_ENABLED=0 go build $(GOFLAGS_REPRO) -o bin/ ./cmd/...
+
+# Reproducible builds: without these Go stamps the git revision into every
+# binary, so the same source hashes differently at each commit and a receipt's
+# code_sha256 could never be replayed against a module built later.
+GOFLAGS_REPRO := -buildvcs=false -trimpath
 
 WORKLOADS := csv-stats hash-bytes primes
 
 wasm:
 	mkdir -p build
-	for w in $(WORKLOADS); do GOOS=wasip1 GOARCH=wasm go build -o build/$$w.wasm ./workloads/$$w || exit 1; done
+	for w in $(WORKLOADS); do GOOS=wasip1 GOARCH=wasm go build $(GOFLAGS_REPRO) -o build/$$w.wasm ./workloads/$$w || exit 1; done
 
 # Local dev only: generates a throwaway publisher key and signs the sample workloads.
 publish: build wasm

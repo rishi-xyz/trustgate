@@ -792,3 +792,48 @@ func TestConfidentialAsyncJob(t *testing.T) {
 		t.Fatalf("wrong decrypted result: %s", p.Stdout)
 	}
 }
+
+func TestReceiptByID(t *testing.T) {
+	e := setup(t)
+	_, out := e.execute(t, map[string]any{"workload": "csv-stats", "input": csvData, "args": []string{"amount"}})
+	id, _ := out["receipt_id"].(string)
+	if id == "" {
+		t.Fatalf("execute must return a receipt_id: %+v", out)
+	}
+
+	// Verify and replay by reference, without passing the bundle.
+	_, v := e.call(t, "verify_receipt", map[string]any{"receipt_id": id, "expected_measurement": e.measure})
+	if v["verified"] != true {
+		t.Fatalf("verify by id failed: %+v", v)
+	}
+	_, r := e.call(t, "replay", map[string]any{"receipt_id": id, "input": csvData})
+	if r["replay_matches"] != true {
+		t.Fatalf("replay by id failed: %+v", r)
+	}
+
+	// A wrong pin is still caught when verifying by id.
+	_, bad := e.call(t, "verify_receipt", map[string]any{"receipt_id": id, "expected_measurement": "not-the-measurement"})
+	if bad["verified"] != false {
+		t.Fatalf("wrong measurement must fail by id too: %+v", bad)
+	}
+
+	// Ambiguous or missing references are rejected.
+	if res, _ := e.call(t, "verify_receipt", map[string]any{"receipt_id": id, "receipt_bundle": out["receipt_bundle"]}); !res.IsError {
+		t.Fatal("both receipt_id and receipt_bundle should be rejected")
+	}
+	if res, _ := e.call(t, "verify_receipt", map[string]any{}); !res.IsError {
+		t.Fatal("no reference at all should be rejected")
+	}
+	if res, _ := e.call(t, "verify_receipt", map[string]any{"receipt_id": "boot-nope-1"}); !res.IsError {
+		t.Fatal("unknown receipt_id should be an error")
+	}
+
+	// Async jobs and confidential jobs get ids too.
+	_, job := e.call(t, "execute_async", map[string]any{"workload": "hash-bytes", "input": "x"})
+	waitJob(t, e, job["job_id"].(string), "succeeded")
+	_, jr := e.call(t, "job_result", map[string]any{"job_id": job["job_id"]})
+	aid, _ := jr["result"].(map[string]any)["receipt_id"].(string)
+	if _, av := e.call(t, "verify_receipt", map[string]any{"receipt_id": aid}); av["verified"] != true {
+		t.Fatalf("async receipt by id failed: %+v", av)
+	}
+}

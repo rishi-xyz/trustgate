@@ -25,9 +25,9 @@ TrustGate proves what code ran on which input in which environment. It does not 
 |---|---|
 | `execute` | Run an approved workload; input as text (`input`) or raw bytes (`input_b64`); returns output plus a signed receipt bundle |
 | `execute_async`, `job_status`, `job_result`, `cancel_job` | Long-running jobs: get a `job_id` immediately, poll, fetch the result, or cancel. Plain tools rather than the MCP Tasks extension (the Go SDK has no Tasks support yet) |
-| `replay` | Re-run the workload in a receipt against the original input and compare the output hash (same server; replay on your own machine for independent evidence) |
+| `replay` | Re-run the workload in a receipt (by `receipt_id`) against the original input and compare the output hash (same server; replay on your own machine for independent evidence) |
 | `execute` with `sealed_input` | **Confidential job**: input encrypted by the data owner, unwrapped only by the attested enclave, result sealed to the owner's key. See below |
-| `verify_receipt` | Check signature, attestation, key binding and an optional pinned measurement |
+| `verify_receipt` | Check signature, attestation, key binding and an optional pinned measurement. Takes the short `receipt_id` returned by `execute` (agents mis-copy the ~6 KB bundle) or the full bundle |
 | `list_workloads`, `get_attestation` | Discover approved workloads and the server's attestation evidence |
 
 ## Confidential jobs

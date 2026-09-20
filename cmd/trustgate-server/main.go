@@ -38,6 +38,11 @@ func main() {
 		vsockPort  = flag.Uint("vsock-port", 0, "listen on this vsock port instead of TCP (required inside a Nitro Enclave)")
 		ctlPort    = flag.Uint("control-vsock-port", 0, "nitro: private vsock port for the parent's control channel (KMS decrypt self-test)")
 		kmsProxy   = flag.Uint("kms-proxy-port", 8000, "nitro: parent vsock-proxy port that forwards to the KMS endpoint")
+		workers    = flag.Int("workers", 2, "workloads that may run at once (extra requests queue)")
+		queueWait  = flag.Duration("queue-timeout", 10*time.Second, "how long a synchronous request waits for a free worker before 'server busy'")
+		maxBodyMB  = flag.Int("max-body-mb", 4, "largest accepted MCP request body, in MiB")
+		stateless  = flag.Bool("stateless", false, "serve MCP without sessions and with plain JSON responses (recommended behind a CDN or load balancer)")
+		writeLimit = flag.Duration("write-timeout", 150*time.Second, "HTTP write timeout; must exceed the longest workload timeout")
 	)
 	flag.Parse()
 
@@ -102,6 +107,11 @@ func main() {
 		DevTrust: devTrust,
 		Token:    os.Getenv("TRUSTGATE_TOKEN"),
 		Keys:     keys,
+
+		Workers:      *workers,
+		QueueTimeout: *queueWait,
+		MaxBodyBytes: int64(*maxBodyMB) << 20,
+		Stateless:    *stateless,
 	})
 	if err != nil {
 		log.Fatal(err)
@@ -133,7 +143,16 @@ func main() {
 		go func() { log.Fatal(ctl.Serve(cl)) }()
 	}
 
-	hs := &http.Server{Addr: *addr, Handler: srv.Handler(), ReadHeaderTimeout: 10 * time.Second}
+	hs := &http.Server{
+		Addr:              *addr,
+		Handler:           srv.Handler(),
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      *writeLimit,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    32 << 10,
+	}
+	log.Printf("workers=%d queue-timeout=%s max-body=%dMiB stateless=%v", *workers, *queueWait, *maxBodyMB, *stateless)
 	if *vsockPort != 0 {
 		l, err := vsock.Listen(uint32(*vsockPort), nil)
 		if err != nil {

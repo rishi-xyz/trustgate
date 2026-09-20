@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -38,6 +39,20 @@ type Config struct {
 	Token string
 	// Keys unwraps data keys for confidential (sealed) jobs. Nil disables them.
 	Keys seal.KeyProvider
+
+	// Workers is the number of workloads that may run at once (default 2, the
+	// enclave's vCPU count). Extra requests queue.
+	Workers int
+	// QueueTimeout is how long a synchronous request waits for a free worker
+	// before getting a "server busy" error (default 10s). Async jobs queue
+	// without a timeout.
+	QueueTimeout time.Duration
+	// MaxBodyBytes caps the size of an MCP request (default 4 MiB).
+	MaxBodyBytes int64
+	// Stateless serves MCP without sessions and answers with plain JSON instead
+	// of an event stream. It is what makes the server easy to put behind a CDN
+	// or load balancer and lets it restart without stranding clients.
+	Stateless bool
 }
 
 // Server holds runtime state.
@@ -45,6 +60,7 @@ type Server struct {
 	cfg         Config
 	attestation []byte
 	jobs        *jobStore
+	pool        *pool
 
 	// Recent receipt bundles by id, so agents can verify or replay by reference
 	// instead of re-typing a ~6 KB attestation document (which they mis-copy).
@@ -108,7 +124,16 @@ func New(cfg Config) (*Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("attest: %w", err)
 	}
-	s := &Server{cfg: cfg, attestation: doc, rByID: map[string]*receipts.Bundle{}}
+	if cfg.Workers <= 0 {
+		cfg.Workers = 2
+	}
+	if cfg.QueueTimeout <= 0 {
+		cfg.QueueTimeout = 10 * time.Second
+	}
+	if cfg.MaxBodyBytes <= 0 {
+		cfg.MaxBodyBytes = 4 << 20
+	}
+	s := &Server{cfg: cfg, attestation: doc, rByID: map[string]*receipts.Bundle{}, pool: newPool(cfg.Workers)}
 	s.jobs = newJobStore(s)
 	return s, nil
 }
@@ -291,6 +316,11 @@ func (s *Server) execute(ctx context.Context, _ *mcp.CallToolRequest, in Execute
 	if err != nil {
 		return nil, ExecuteOutput{}, err
 	}
+	release, err := s.pool.acquire(ctx, s.cfg.QueueTimeout)
+	if err != nil {
+		return nil, ExecuteOutput{}, err
+	}
+	defer release()
 	out, runErr, err := s.runPrepared(ctx, p)
 	if err != nil {
 		return nil, ExecuteOutput{}, err
@@ -335,6 +365,11 @@ func (s *Server) replay(ctx context.Context, _ *mcp.CallToolRequest, in ReplayIn
 	if err != nil {
 		return nil, ReplayOutput{}, err
 	}
+	release, err := s.pool.acquire(ctx, s.cfg.QueueTimeout)
+	if err != nil {
+		return nil, ReplayOutput{}, err
+	}
+	defer release()
 	checks := verify.Bundle(&b, verify.Options{AllowDev: s.cfg.Provider.Mode() == attest.ModeDev, DevTrust: s.cfg.DevTrust})
 	checks = append(checks, verify.Replay(ctx, &b, wl.Wasm, stdin)...)
 	return nil, ReplayOutput{
@@ -426,11 +461,15 @@ func (s *Server) MCP() *mcp.Server {
 // /.well-known/trustgate.
 func (s *Server) Handler() http.Handler {
 	srv := s.MCP()
-	mcpH := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv }, nil)
+	mcpH := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv },
+		&mcp.StreamableHTTPOptions{Stateless: s.cfg.Stateless, JSONResponse: s.cfg.Stateless})
 
 	mux := http.NewServeMux()
-	mux.Handle("/mcp", s.auth(mcpH))
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok")) })
+	mux.Handle("/mcp", http.MaxBytesHandler(s.auth(mcpH), s.cfg.MaxBodyBytes))
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(s.Stats())
+	})
 	mux.HandleFunc("/.well-known/trustgate", func(w http.ResponseWriter, _ *http.Request) {
 		info := struct {
 			AttestationOutput
@@ -444,6 +483,9 @@ func (s *Server) Handler() http.Handler {
 	})
 	return mux
 }
+
+// Stats returns counters for health checks and monitoring; no request data.
+func (s *Server) Stats() Stats { return s.pool.stats() }
 
 func (s *Server) auth(next http.Handler) http.Handler {
 	if s.cfg.Token == "" {

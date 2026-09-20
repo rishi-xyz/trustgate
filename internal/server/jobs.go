@@ -18,9 +18,8 @@ import (
 // (a handle, a status, a result, cancel) so they can be mapped later.
 
 const (
-	maxConcurrentJobs = 2 // the enclave has two vCPUs
-	maxLiveJobs       = 64
-	jobTTL            = time.Hour
+	maxLiveJobs = 64
+	jobTTL      = time.Hour
 )
 
 const (
@@ -43,14 +42,13 @@ type job struct {
 }
 
 type jobStore struct {
-	s   *Server
-	mu  sync.Mutex
-	m   map[string]*job
-	sem chan struct{}
+	s  *Server
+	mu sync.Mutex
+	m  map[string]*job
 }
 
 func newJobStore(s *Server) *jobStore {
-	return &jobStore{s: s, m: map[string]*job{}, sem: make(chan struct{}, maxConcurrentJobs)}
+	return &jobStore{s: s, m: map[string]*job{}}
 }
 
 type JobOutput struct {
@@ -111,13 +109,14 @@ func (js *jobStore) submit(_ context.Context, _ *mcp.CallToolRequest, in Execute
 }
 
 func (js *jobStore) run(ctx context.Context, j *job, p *prepared) {
-	select {
-	case js.sem <- struct{}{}:
-		defer func() { <-js.sem }()
-	case <-ctx.Done():
+	// Async jobs share the worker pool with synchronous calls and may wait in
+	// the queue indefinitely (until cancelled), unlike synchronous requests.
+	release, err := js.s.pool.acquire(ctx, -1)
+	if err != nil {
 		js.finish(j, nil, context.Canceled, nil)
 		return
 	}
+	defer release()
 	js.mu.Lock()
 	if j.status == jobCancelled {
 		js.mu.Unlock()

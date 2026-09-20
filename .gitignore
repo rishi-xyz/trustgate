@@ -30,3 +30,6 @@ opencode.json
 
 # guided-demo output (contains keys, salts and receipts)
 .demo/
+
+# SAM build output
+.aws-sam/

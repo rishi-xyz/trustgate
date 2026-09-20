@@ -6,3 +6,8 @@ build
 .trustgate-dev/*.log
 .trustgate-dev/*.json
 .trustgate-dev/root.key
+
+# not part of the enclave image; keeps enclave builds independent of these
+lambda/
+web/
+agents/

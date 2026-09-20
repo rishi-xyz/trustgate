@@ -57,6 +57,10 @@ curl -s -X POST localhost:3000/verify -H 'Content-Type: application/json' \
 
 Build with `CGO_ENABLED=0`, so the binary does not depend on the host's glibc. `sam deploy` (not done) would publish it as a public URL. The test fixture `lambda/verifier/testdata/nitro-receipt.json` is a real receipt from a real enclave run; like every Nitro attestation it contains the EC2 instance and enclave IDs, but no credentials or account ID.
 
+## Running it for others
+
+`docs/production.md` is the runbook for a public HTTPS deployment (CloudFront and WAF in front, nginx and systemd on the parent, a hardened stateless server in the enclave), with the limits stated plainly. `docs/judge-guide.md` is what to give someone who wants to try it.
+
 ## Quick start (local)
 
 ```bash

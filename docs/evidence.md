@@ -23,8 +23,9 @@ Builds referenced (PCR0 is the SHA-384 measurement of the whole enclave image; a
 | B-evil (deliberately modified) | `ffcbc3320ef1edb0ae85a9ac36fe9a39a863dce3d60322489155749eb32c42b9b995c516d1969520aa71e5c514bec594` | section 2 |
 | C | `92de20fec5a521505d849c92cc4827e3ceb9c68bec6d09e98eedc1d50b3e224d09a34afb905822e6ac042bfe6607d2a4` | section 3 |
 | D | `1321d0d4652b0c26ee5a51f3aa11b7f6584e780e23fa2a658a75d6c16c1992efe53bcba047e188f9cda6d7a01c8e74db` | section 6 |
+| E (reproducible build) | `1c680df50a18ba46d3bce7af9d63d653335593a788d25c624aa378c9c9e782072408baf0a836f01d4a6481dc243a030e` | section 7 |
 
-The same source produces a different PCR0 on each rebuild (builds are not reproducible yet), which is why each section pins its own build.
+Builds A to D were made before builds were reproducible: rebuilding the same source gave a different PCR0 each time, which is why each of those sections pins its own build. Build E onwards is reproducible (section 7).
 
 ## 1. Real Nitro attestation, verified off the instance (build A)
 
@@ -387,7 +388,68 @@ The agent said so plainly instead of claiming success. The fix was server-side: 
 
 `verify_receipt` called by an agent runs **on the same server** that produced the receipt, so it is a convenience check, not independent evidence. Independent verification is the CLI on a machine you control (sections 1 to 3), which checks the attestation against the AWS root CA itself.
 
-## 7. What this shows, and what it does not
+## 7. Reproducible builds, and the full guided run (build E)
+
+**The problem.** Rebuilding the same source gave a different enclave measurement every time, which meant the KMS key policy had to be edited after every rebuild, and it undermined the idea of a published expected measurement. Rehearsing the demo exposed one cause: Go stamps the git revision into every binary, so the same source produced a different WASM hash at each commit, and `replay` failed against a module built later with `workload hash: supplied wasm hashes to sha256:cd36d478…, receipt says sha256:8fbb22ec…`.
+
+**The fixes:**
+- WASM and server builds use `-buildvcs=false -trimpath`. Checked: the same source gives the same WASM hash at HEAD and three commits back (`20709cdb…`); the default build gave `cd36d478…` at HEAD and `0a2e6839…` three commits back.
+- The enclave image pins its base images by digest, normalises every file's timestamp in the build stage, and copies the staged tree to `/` in one step (copying a directory to a new path made Docker stamp it with the build time).
+- Locally, two `--no-cache` builds with touched inputs produce identical image layers. This was found by inspecting layer contents: the binary and key layers matched and only the `registry/` directory entry's timestamp differed, which the last change removed.
+
+**The check on the parent instance** (`make eif-check` builds the enclave image from scratch twice, the second time after touching the inputs as a fresh tarball would, and compares PCR0):
+
+```
+$ make eif-check
+[... two from-scratch docker builds and two nitro-cli build-enclave runs ...]
+PCR0 build 1: 1c680df50a18ba46d3bce7af9d63d653335593a788d25c624aa378c9c9e782072408baf0a836f01d4a6481dc243a030e
+PCR0 build 2: 1c680df50a18ba46d3bce7af9d63d653335593a788d25c624aa378c9c9e782072408baf0a836f01d4a6481dc243a030e
+REPRODUCIBLE: same source, same measurement
+```
+
+Docker's own image IDs differed between the two builds (`afcf11c2…` and `08e7d2a3…`); the measurement did not. The KMS key policy was updated once, for this measurement, and the attested decrypt then succeeded:
+
+```
+$ bin/trustgate-parent kms-test -ciphertext-file ~/ct.b64 -region ap-south-1
+{
+  "ok": true,
+  "plaintext_sha256": "c735232a670453957009e8341e5b9be106b2f12fdbcc1028b00733a537b84a43",
+  "plaintext_len": 21,
+  "measurement": "1c680df50a18ba46d3bce7af9d63d653335593a788d25c624aa378c9c9e782072408baf0a836f01d4a6481dc243a030e"
+}
+```
+
+**The guided demo script against build E**, run from the laptop with the measurement pinned (`scripts/demo-enclave.sh`, non-confidential sections; output filtered to the check lines):
+
+```
+server: mode=nitro measurement=1c680df50a18ba46d3bce7af9d63d653…
+== 2. Anyone can verify it independently: signature, real Nitro attestation, key binding, pinned measurement
+✓ attestation document: nitro attestation verified
+✓ enclave measurement: matches pinned 1c680df5…a030e
+EXECUTION VERIFIED (proves what ran and where, not that the result is correct)
+== 3. ...and replay it on this machine: same code + same input = same output hash
+✓ input hash: supplied input matches receipt
+✓ replay output hash: replayed output hash matches receipt
+EXECUTION VERIFIED (proves what ran and where, not that the result is correct)
+== 4. Attack: change one byte of the input, then replay
+VERIFICATION FAILED
+   ^ refused, as expected
+== 5. Attack: edit the receipt (overwrite the output hash), then verify
+VERIFICATION FAILED
+   ^ refused, as expected
+== 6. Attack: verify against the wrong enclave measurement
+VERIFICATION FAILED
+   ^ refused, as expected
+== 7. Binary input and a long-running async job
+[... both succeed ...]
+every attack was refused and every check behaved as expected
+```
+
+The replay in step 3 used a `.wasm` **built independently on the laptop** (`20709cdb…`); it matched the module baked into the enclave image, which is the end-to-end proof that the reproducible-build fix works.
+
+**What this does and does not establish.** Reproducibility was confirmed on one parent instance, for one source tree, with the base images pinned by digest. Someone rebuilding independently needs the same source, the same pinned base images and the same Nitro CLI version to expect the same PCR0; a different Nitro CLI or kernel image could change it. This was not tested.
+
+## 8. What this shows, and what it does not
 
 **Shown:**
 - A workload's identity, input and output are committed in a signed receipt, and the signing key is bound to a real Nitro attestation document that anyone can verify against the AWS root.
@@ -400,5 +462,5 @@ The agent said so plainly instead of claiming success. The fix was server-side: 
 - AWS Nitro and its hardware and firmware remain part of the trust root.
 - The parent still sees metadata: timing, sizes, which workload and arguments, and it can delay or drop jobs.
 - The MCP endpoint had no authentication (only a security-group IP allowlist) and used plain HTTP during these runs; confidentiality of sealed jobs did not depend on either.
-- Builds are not reproducible yet, so the key policy is updated after each rebuild.
+- Reproducible enclave builds were confirmed on one machine with pinned inputs (section 7); independent rebuilds by others with a different toolchain version were not tested.
 - The enclave's memory contents were not attacked directly; the isolation property rests on AWS's documented Nitro guarantees.

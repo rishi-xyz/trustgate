@@ -39,6 +39,12 @@ type Result struct {
 	Duration time.Duration
 }
 
+// compilationCache is shared by every execution, so a module is compiled once
+// per process rather than on every call. It only stores compiled machine code;
+// each Run still gets its own runtime, memory and clock, so isolation and
+// determinism are unaffected.
+var compilationCache = wazero.NewCompilationCache()
+
 // ErrLimit is returned (wrapped) when a resource limit was hit.
 var ErrLimit = errors.New("resource limit exceeded")
 
@@ -76,6 +82,7 @@ func Run(ctx context.Context, wasm, stdin []byte, args []string, lim Limits) (*R
 		pages = 65536
 	}
 	rt := wazero.NewRuntimeWithConfig(ctx, wazero.NewRuntimeConfig().
+		WithCompilationCache(compilationCache).
 		WithMemoryLimitPages(pages).
 		WithCloseOnContextDone(true))
 	defer rt.Close(context.Background())

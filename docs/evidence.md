@@ -449,7 +449,52 @@ The replay in step 3 used a `.wasm` **built independently on the laptop** (`2070
 
 **What this does and does not establish.** Reproducibility was confirmed on one parent instance, for one source tree, with the base images pinned by digest. Someone rebuilding independently needs the same source, the same pinned base images and the same Nitro CLI version to expect the same PCR0; a different Nitro CLI or kernel image could change it. This was not tested.
 
-## 8. What this shows, and what it does not
+## 8. Independent verifier on Lambda, tested with SAM Local
+
+`verify_receipt` on the server is a convenience check, since the server that produced the receipt checks it (section 6). `lambda/verifier` is a Lambda that verifies a receipt from somewhere else, using the same verification code, and refuses software-only dev receipts. It was built and run **locally with SAM Local** (a Lambda container on the laptop); nothing was deployed to AWS.
+
+Build and run (the binary is built static with `CGO_ENABLED=0`; the first build was dynamically linked against the laptop's newer glibc, which the Lambda AL2023 image may not have):
+
+```
+$ cd lambda && CGO_ENABLED=0 sam build
+Build Succeeded
+$ file .aws-sam/build/VerifierFunction/bootstrap
+[...] ELF 64-bit LSB executable, x86-64, statically linked
+$ sam local start-api -p 3000
+Mounting VerifierFunction at http://127.0.0.1:3000/{proxy+} [...]
+```
+
+Tests through HTTP, using a **real receipt from the real enclave** (build E) as the input. Output filtered to the check names and status:
+
+```
+== valid receipt, pinned to the enclave's PCR0
+{"verified":true,"checks":[{"name":"receipt signature","status":"pass"},{"name":"attestation reference","status":"pass"},{"name":"attestation document","status":"pass"},{"name":"signing key binding","status":"pass"},{"name":"enclave measurement","status":"pass"}]}
+
+== wrong pinned measurement
+{"verified":false,"failed":["enclave measurement"]}
+
+== edited receipt (output hash overwritten)
+{"verified":false,"failed":["receipt signature"]}
+
+== garbage body
+HTTP 400
+```
+
+The one-file page `web/verify.html` was driven in headless Chrome against the same SAM Local endpoint (fill in the receipt and pin, click Verify, read the result):
+
+```
+valid+pin => Verified: what ran and where is confirmed | ok | pass:receipt signature, pass:attestation reference, pass:attestation document, pass:signing key binding, pass:enclave measurement
+edited    => Verification FAILED | bad | fail:receipt signature, pass:attestation reference, pass:attestation document, pass:signing key binding, pass:enclave measurement
+not json  => error message shown: "The receipt is not valid JSON."
+```
+
+Unit tests in `lambda/verifier` (same fixture, no network): valid receipt passes all 5 checks; an unpinned request passes with the measurement check reported as *skipped*, not passed; a wrong pin, a forged receipt, a corrupted attestation document and a software-only dev receipt are all refused; oversized and malformed requests return 413 and 400.
+
+**No change to the enclave.** The enclave server binary, built with the reproducible flags, has the same SHA-256 before and after this work (`ad38a76a…cd377a`), so the enclave image, its PCR0 and the KMS key policy are unaffected.
+
+**Limits.** The verifier checks signature, attestation, key binding and a pinned measurement; it does not replay the workload (that needs the `.wasm`). It is only as independent as where you run it and what measurement you pin. The test receipt embeds the EC2 instance and enclave IDs, as every Nitro attestation does.
+
+## 9. What this shows, and what it does not
 
 **Shown:**
 - A workload's identity, input and output are committed in a signed receipt, and the signing key is bound to a real Nitro attestation document that anyone can verify against the AWS root.

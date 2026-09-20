@@ -42,6 +42,21 @@ The data owner runs `trustgate seal`, which encrypts the input with a fresh data
 
 Locally (`-mode dev`) a local key stands in for KMS; `make demo` shows the whole flow. On Nitro the data key is unwrapped by real KMS, gated by the enclave's measurement.
 
+## Independent verifier (Lambda)
+
+`verify_receipt` on the server is a convenience: the server that produced a receipt checks it. `lambda/verifier` is an AWS Lambda that does the same checks from somewhere else (signature, the AWS Nitro attestation document against the AWS root CA, key binding, and a pinned enclave measurement), and refuses dev-mode receipts. `web/verify.html` is a one-file page in front of it: paste a receipt and the PCR0 you expect, and it shows a tick or cross per check.
+
+Run it locally with SAM Local (nothing is deployed, everything runs in a local Lambda container):
+
+```bash
+cd lambda && CGO_ENABLED=0 sam build && sam local start-api      # http://127.0.0.1:3000
+# then open web/verify.html in a browser
+curl -s -X POST localhost:3000/verify -H 'Content-Type: application/json' \
+  -d "{\"receipt_bundle\": $(cat verifier/testdata/nitro-receipt.json), \"expected_measurement\": \"<PCR0>\"}"
+```
+
+Build with `CGO_ENABLED=0`, so the binary does not depend on the host's glibc. `sam deploy` (not done) would publish it as a public URL. The test fixture `lambda/verifier/testdata/nitro-receipt.json` is a real receipt from a real enclave run; like every Nitro attestation it contains the EC2 instance and enclave IDs, but no credentials or account ID.
+
 ## Quick start (local)
 
 ```bash
@@ -63,4 +78,5 @@ See `.agent/setup.md` for MCP client setup and the AWS steps.
 - `internal/kms`, `internal/control` attested KMS decrypt and the enclave control channel
 - `cmd/vsock-forwarder`, `cmd/trustgate-parent` parent-side helpers for Nitro
 - `Dockerfile.nitro` enclave image (registry and publisher key baked in, so they are part of the measurement)
+- `lambda/verifier`, `web/verify.html` independent receipt verifier (Lambda, tested with SAM Local) and its web page
 - `tests/` end-to-end and attack tests

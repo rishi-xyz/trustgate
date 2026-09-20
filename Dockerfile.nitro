@@ -1,16 +1,25 @@
 # Enclave image. Everything the server trusts (workload registry, publisher
 # public key) is baked in, so it is covered by the enclave measurement (PCR0).
 # Build the registry first on the build host: `make publish`.
-FROM golang:1.26-bookworm AS build
+#
+# Base images are pinned by digest and every file's timestamp is normalised, so
+# the same source produces the same image and therefore the same measurement.
+FROM golang:1.26-bookworm@sha256:a688600ca24f8a4d3ca77f95b0dd40704a9fc787c826660eb7ba0b641b8b175d AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -buildvcs=false -trimpath -ldflags='-s -w -buildid=' -o /out/trustgate-server ./cmd/trustgate-server
+# Stage everything that ends up in the image, then set all timestamps to the
+# epoch (the final image is distroless and has no shell to do it there).
+RUN CGO_ENABLED=0 go build -buildvcs=false -trimpath -ldflags='-s -w -buildid=' -o /out/trustgate-server ./cmd/trustgate-server \
+ && mkdir -p /out/registry \
+ && cp registry/manifests/* /out/registry/ \
+ && cp .trustgate-dev/publisher.pub /out/publisher.pub \
+ && find /out -exec touch -h -d @0 {} +
 
-FROM gcr.io/distroless/static-debian12
-COPY --from=build /out/trustgate-server /trustgate-server
-COPY registry/manifests /registry
-COPY .trustgate-dev/publisher.pub /publisher.pub
+FROM gcr.io/distroless/static-debian12@sha256:d75cdd72874d4790092fcb1b058493ecf6bb5bf2b2b897045b00ff01d91843f2
+# Copy the whole staged tree to / in one step: copying a directory to a new path
+# would make Docker create that directory stamped with the build time.
+COPY --from=build /out/ /
 # No TCP inside an enclave: serve over vsock; the parent forwards TCP -> vsock.
 ENTRYPOINT ["/trustgate-server", "-mode", "nitro", "-registry", "/registry", "-publisher-pub-file", "/publisher.pub", "-vsock-port", "8080", "-control-vsock-port", "8081"]

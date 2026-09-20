@@ -41,7 +41,7 @@ clean:
 	rm -rf bin build .trustgate-dev registry/manifests
 
 # ---- Nitro (run on the enclave-enabled parent instance) ----
-.PHONY: eif run-enclave forwarder
+.PHONY: eif eif-check run-enclave forwarder
 eif:
 	docker build -t trustgate:nitro -f Dockerfile.nitro .
 	nitro-cli build-enclave --docker-uri trustgate:nitro --output-file build/trustgate.eif | tee build/trustgate.pcrs.json
@@ -52,3 +52,15 @@ run-enclave:
 
 forwarder:
 	bin/vsock-forwarder -listen :8443 -cid 16 -port 8080
+
+# Reproducibility check for the enclave measurement: build the image from scratch
+# twice (second time after touching the inputs, as a fresh tarball would) and
+# compare PCR0. Leaves the second image in build/check2.eif.
+eif-check:
+	docker build --no-cache -t trustgate:nitro -f Dockerfile.nitro .
+	nitro-cli build-enclave --docker-uri trustgate:nitro --output-file build/check1.eif | jq -r .Measurements.PCR0 > build/pcr1
+	touch registry/manifests/* .trustgate-dev/publisher.pub
+	docker build --no-cache -t trustgate:nitro -f Dockerfile.nitro .
+	nitro-cli build-enclave --docker-uri trustgate:nitro --output-file build/check2.eif | jq -r .Measurements.PCR0 > build/pcr2
+	@echo "PCR0 build 1: $$(cat build/pcr1)"; echo "PCR0 build 2: $$(cat build/pcr2)"; \
+	  cmp -s build/pcr1 build/pcr2 && echo "REPRODUCIBLE: same source, same measurement" || { echo "DIFFERENT: the image is not reproducible"; exit 1; }

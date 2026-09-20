@@ -1,8 +1,20 @@
 # TrustGate
 
-Attested compute for AI agents. An MCP agent submits an approved WebAssembly workload; it runs under deny-by-default capabilities and resource limits; the agent gets the result plus a signed receipt that can be independently verified and, for deterministic workloads, replayed.
+A verifiable remote execution environment for AI agents: attested compute with signed proof receipts. An MCP agent submits an approved WebAssembly workload; it runs under deny-by-default capabilities and resource limits inside an isolated, measured, attested environment; the agent gets the result plus a signed receipt that can be independently verified and, for deterministic workloads, replayed.
+
+"Trustless" here means you check a receipt instead of trusting the host or the agent's word. AWS Nitro remains the root of trust.
 
 > **Proof of execution and environment, not proof of correctness.**
+
+## The execution environment
+
+The environment is what makes a receipt worth checking:
+
+- **Isolated:** the job runs in wazero inside an AWS Nitro Enclave; the parent instance cannot look inside.
+- **Measured:** the enclave image has a measurement (PCR0). Any change to the image changes it.
+- **Attested:** AWS signs an attestation document naming the image that is running. The receipt-signing key is bound to that document.
+
+A receipt is the proof that a given job ran in that environment.
 
 ## Status
 
@@ -44,13 +56,14 @@ Locally (`-mode dev`) a local key stands in for KMS; `make demo` shows the whole
 
 ## Independent verifier (Lambda)
 
-`verify_receipt` on the server is a convenience: the server that produced a receipt checks it. `lambda/verifier` is an AWS Lambda that does the same checks from somewhere else (signature, the AWS Nitro attestation document against the AWS root CA, key binding, and a pinned enclave measurement), and refuses dev-mode receipts. `web/verify.html` is a one-file page in front of it: paste a receipt and the PCR0 you expect, and it shows a tick or cross per check.
+`verify_receipt` on the server is a convenience: the server that produced a receipt checks it. `lambda/verifier` is an AWS Lambda that does the same checks from somewhere else (signature, the AWS Nitro attestation document against the AWS root CA, key binding, and a pinned enclave measurement), and refuses dev-mode receipts. The `/verify` page of the website (`web/site`) is a front end for it: paste a receipt and the PCR0 you expect, and it shows a tick or cross per check.
 
 Run it locally with SAM Local (nothing is deployed, everything runs in a local Lambda container):
 
 ```bash
 cd lambda && CGO_ENABLED=0 sam build && sam local start-api      # http://127.0.0.1:3000
-# then open web/verify.html in a browser
+# then, in another terminal, run the site on a different port (SAM Local uses 3000) and open /verify:
+#   cd web/site && npm install && npm run dev -- -p 4000      # http://localhost:4000/verify
 curl -s -X POST localhost:3000/verify -H 'Content-Type: application/json' \
   -d "{\"receipt_bundle\": $(cat verifier/testdata/nitro-receipt.json), \"expected_measurement\": \"<PCR0>\"}"
 ```
@@ -86,6 +99,7 @@ See `.agent/setup.md` for MCP client setup and the AWS steps.
 - `internal/kms`, `internal/control` attested KMS decrypt and the enclave control channel
 - `cmd/vsock-forwarder`, `cmd/trustgate-parent` parent-side helpers for Nitro
 - `Dockerfile.nitro` enclave image (registry and publisher key baked in, so they are part of the measurement)
-- `lambda/verifier`, `web/verify.html` independent receipt verifier (Lambda, tested with SAM Local) and its web page
+- `lambda/verifier` independent receipt verifier (Lambda, tested with SAM Local)
+- `web/site` Next.js website: landing page and the `/verify` page in front of the verifier. `npm run build` is the standard build (Vercel); `npm run build:static` writes plain files to `out/` for any static host (`STATIC_EXPORT=1`); `vercel.json` pins the Next.js framework preset
 - `agents/` a Strands (AWS) agent that drives TrustGate over MCP with Bedrock; `--check` tests the MCP path without a model
 - `tests/` end-to-end and attack tests

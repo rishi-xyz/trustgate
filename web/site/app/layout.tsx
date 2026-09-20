@@ -11,9 +11,9 @@ const fraunces = Fraunces({
 const jetbrains = JetBrains_Mono({ variable: "--font-jetbrains", subsets: ["latin"] });
 
 export const metadata: Metadata = {
-  title: "TrustGate: attested compute for AI agents",
+  title: "TrustGate: a verifiable execution environment for AI agents",
   description:
-    "Agents run approved WebAssembly workloads inside an AWS Nitro Enclave and get back a signed receipt anyone can verify independently.",
+    "Agents run approved WebAssembly workloads inside an AWS Nitro Enclave and get back a signed proof receipt anyone can verify independently.",
 };
 
 export default function RootLayout({ children }: LayoutProps<"/">) {

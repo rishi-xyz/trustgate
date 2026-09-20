@@ -21,8 +21,8 @@ const checks = [
 
 const steps = [
   ["01", "Submit", "An agent calls an MCP tool with an approved, publisher-signed workload and an input."],
-  ["02", "Isolate", "The workload runs in wazero inside a Nitro Enclave. No capabilities unless granted, with CPU and memory limits."],
-  ["03", "Attest", "The receipt-signing key is bound to a Nitro attestation document. Receipts are hash-chained and Ed25519-signed."],
+  ["02", "Isolate", "The workload runs in wazero inside a measured Nitro Enclave. No capabilities unless granted, with CPU and memory limits."],
+  ["03", "Attest", "AWS attests to the enclave image. The receipt-signing key is bound to that Nitro attestation document. Receipts are hash-chained and Ed25519-signed."],
   ["04", "Verify", "Anyone checks the receipt against the AWS root CA and a pinned measurement, from somewhere else. Deterministic jobs can be replayed."],
 ];
 
@@ -52,6 +52,7 @@ const gaps = [
   "Transport to the MCP endpoint is plain HTTP",
   "The parent still sees metadata and can delay or drop jobs",
   "dev mode has no hardware isolation and is rejected by the verifier by default",
+  "AWS Nitro remains the root of trust: this is verifiable execution, not the absence of trust",
 ];
 
 export default function Home() {
@@ -98,11 +99,12 @@ export default function Home() {
               Verified on real AWS Nitro hardware
             </span>
             <h1 className="my-[22px] text-[clamp(2.6rem,6vw,4.6rem)]">
-              Don&apos;t trust the agent&apos;s output. <em className="italic text-accent">Check the receipt.</em>
+              Trustless, verifiable remote execution <em className="italic text-accent">for AI agents.</em>
             </h1>
             <p className="mb-8 max-w-[34em] text-[1.15rem] text-muted">
-              TrustGate runs approved WebAssembly workloads for AI agents inside an AWS Nitro Enclave, then hands back a
-              signed receipt that proves which code ran, on which input, in which measured environment.
+              TrustGate is a verifiable execution environment for AI agents. Approved WebAssembly workloads run inside an
+              AWS Nitro Enclave, and every result comes back with a signed proof receipt. Don&apos;t trust the host or the
+              agent&apos;s output: check the receipt.
             </p>
             <div className="flex flex-wrap gap-3">
               <a className={btnPrimary} href="/verify/">Verify a receipt &rarr;</a>
@@ -148,8 +150,8 @@ export default function Home() {
           <div className={`${eyebrow} mb-3.5 text-accent`}>How it works</div>
           <h2 className={h2}>From agent request to independent proof.</h2>
           <p className={lede}>
-            An MCP agent submits a job. It runs under deny-by-default capabilities and resource limits. What comes back is
-            the result plus evidence, not a promise.
+            An MCP agent submits a job. It runs in an isolated, measured, attested environment, under deny-by-default
+            capabilities and resource limits. What comes back is the result plus a receipt that proves it, not a promise.
           </p>
           <div className="mt-[52px] grid overflow-hidden rounded-2xl border border-line bg-card md:grid-cols-4">
             {steps.map(([n, t, d]) => (
@@ -280,7 +282,7 @@ export default function Home() {
 
       <footer className="border-t border-line py-7 text-[0.85rem] text-muted">
         <div className={`${wrap} flex flex-wrap justify-between gap-3`}>
-          <span>TrustGate · attested compute for AI agents</span>
+          <span>TrustGate · a verifiable execution environment for AI agents</span>
           <span>Built on AWS Nitro Enclaves, KMS and Lambda</span>
         </div>
       </footer>

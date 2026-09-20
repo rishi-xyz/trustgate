@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TrustGate Verifier</title>
+<style>
+  :root { --bg:#f7f7f5; --fg:#1b1b1a; --muted:#6b6b66; --card:#fff; --line:#ddddd6; --ok:#1a7f45; --bad:#b3261e; --skip:#8a6d00; --accent:#1f4fd8; }
+  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --bg:#161615; --fg:#ecece8; --muted:#9a9a93; --card:#1f1f1d; --line:#33332f; --ok:#4cc38a; --bad:#ff7b72; --skip:#e3b341; --accent:#7aa2ff; } }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 760px; margin: 0 auto; padding: 24px 16px 64px; }
+  h1 { font-size: 1.5rem; margin: 0 0 4px; }
+  p.lead { color: var(--muted); margin: 0 0 20px; }
+  label { display:block; font-weight:600; margin: 16px 0 6px; }
+  textarea, input { width:100%; padding:10px; border:1px solid var(--line); border-radius:8px; background:var(--card); color:var(--fg); font: 13px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  textarea { min-height: 180px; resize: vertical; }
+  .hint { color: var(--muted); font-size: .85rem; margin-top: 4px; }
+  button { margin-top: 16px; padding: 10px 18px; border:0; border-radius: 8px; background: var(--accent); color:#fff; font: inherit; font-weight:600; cursor:pointer; }
+  button:disabled { opacity:.6; cursor: default; }
+  #result { margin-top: 24px; background:var(--card); border:1px solid var(--line); border-radius:10px; padding:16px; display:none; }
+  #verdict { font-weight:700; font-size:1.1rem; margin:0 0 10px; }
+  #verdict.ok { color: var(--ok); } #verdict.bad { color: var(--bad); }
+  ul { list-style:none; margin:0; padding:0; }
+  li { display:grid; grid-template-columns: 1.4em 1fr; gap: 4px 8px; padding: 6px 0; border-top: 1px solid var(--line); }
+  li:first-child { border-top:0; }
+  .mark { font-weight:700; } .pass .mark { color:var(--ok); } .fail .mark { color:var(--bad); } .skip .mark { color:var(--skip); }
+  .name { font-weight:600; } .detail { color:var(--muted); font-size:.88rem; word-break: break-word; grid-column: 2; }
+  .note { margin-top: 12px; color: var(--muted); font-size: .88rem; }
+  .err { color: var(--bad); margin-top: 12px; }
+  details { margin-top: 20px; color: var(--muted); font-size: .88rem; }
+</style>
+</head>
+<body>
+<main>
+  <h1>TrustGate receipt verifier</h1>
+  <p class="lead">Paste a receipt and the enclave measurement you expect. This page asks an independent verifier, not the server that ran the job, to check the signature, the AWS Nitro attestation and the key binding.</p>
+
+  <label for="receipt">Receipt bundle (JSON)</label>
+  <textarea id="receipt" spellcheck="false" placeholder='{"attestation": "...", "receipt": {...}, "sig": "ed25519:..."}'></textarea>
+  <div class="hint">The file saved by <code>trustgate exec</code>, or the <code>receipt_bundle</code> from an MCP result.</div>
+
+  <label for="pin">Expected enclave measurement (PCR0, hex)</label>
+  <input id="pin" spellcheck="false" placeholder="96 hex characters. Leave empty to skip the measurement check.">
+  <div class="hint">Without a pinned measurement the check is skipped, and you have not confirmed which enclave image ran.</div>
+
+  <label for="api">Verifier API address</label>
+  <input id="api" value="http://127.0.0.1:3000">
+
+  <button id="go">Verify</button>
+
+  <section id="result" aria-live="polite">
+    <p id="verdict"></p>
+    <ul id="checks"></ul>
+    <p class="note" id="note"></p>
+  </section>
+  <p class="err" id="err"></p>
+
+  <details>
+    <summary>What this does and does not show</summary>
+    <p>A pass means: the receipt is signed by a key that a genuine AWS Nitro attestation document vouches for, and (if you pinned it) that document names the enclave image you expected. It does not mean the workload's answer is correct, and AWS Nitro remains the root of trust.</p>
+  </details>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const MARK = { pass: "✓", fail: "✗", skip: "–" };
+
+$("go").addEventListener("click", async () => {
+  $("err").textContent = ""; $("result").style.display = "none";
+  let bundle;
+  try { bundle = JSON.parse($("receipt").value); }
+  catch { $("err").textContent = "The receipt is not valid JSON."; return; }
+
+  const base = $("api").value.trim().replace(/\/+$/, "");
+  $("go").disabled = true;
+  try {
+    const res = await fetch(base + "/verify", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ receipt_bundle: bundle, expected_measurement: $("pin").value.trim() }),
+    });
+    const data = await res.json();
+    if (!res.ok) { $("err").textContent = data.error || ("Verifier returned " + res.status); return; }
+
+    $("verdict").textContent = data.verified ? "Verified: what ran and where is confirmed" : "Verification FAILED";
+    $("verdict").className = data.verified ? "ok" : "bad";
+    const ul = $("checks"); ul.textContent = "";
+    for (const c of data.checks) {
+      const li = document.createElement("li"); li.className = c.status;
+      const m = document.createElement("span"); m.className = "mark"; m.textContent = MARK[c.status] || "?";
+      const n = document.createElement("span"); n.className = "name"; n.textContent = c.name;
+      li.append(m, n);
+      if (c.detail) { const d = document.createElement("span"); d.className = "detail"; d.textContent = c.detail; li.append(d); }
+      ul.append(li);
+    }
+    $("note").textContent = data.note || "";
+    $("result").style.display = "block";
+  } catch (e) {
+    $("err").textContent = "Could not reach the verifier at " + base + ". Is it running? (" + e.message + ")";
+  } finally { $("go").disabled = false; }
+});
+</script>
+</body>
+</html>

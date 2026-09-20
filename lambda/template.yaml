@@ -1,0 +1,34 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Independent TrustGate receipt verifier. Checks a receipt's signature, its AWS
+  Nitro attestation document, the key binding and a pinned enclave measurement,
+  from somewhere other than the enclave that produced the receipt.
+
+Globals:
+  Function:
+    Timeout: 10
+    MemorySize: 256
+
+Resources:
+  VerifierFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: go1.x
+    Properties:
+      CodeUri: verifier/
+      Handler: bootstrap
+      Runtime: provided.al2023
+      Architectures: [x86_64]
+      Events:
+        Root:
+          Type: HttpApi
+          Properties: {Path: /, Method: ANY}
+        Any:
+          Type: HttpApi
+          Properties: {Path: '/{proxy+}', Method: ANY}
+
+Outputs:
+  VerifierUrl:
+    Description: Base URL of the verifier (POST /verify)
+    Value: !Sub "https://${ServerlessHttpApi}.execute-api.${AWS::Region}.amazonaws.com/"

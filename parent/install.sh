@@ -20,7 +20,10 @@ for f in bin/vsock-forwarder bin/trustgate-parent; do
 done
 
 echo "== packages"
-dnf install -y nginx jq curl >/dev/null
+# Amazon Linux 2023 ships curl-minimal, which already provides /usr/bin/curl:
+# asking dnf for a package named "curl" conflicts with it, so only install what is missing.
+dnf install -y nginx jq >/dev/null
+command -v curl >/dev/null || { echo "curl is missing; install curl-minimal"; exit 1; }
 
 echo "== files"
 install -d -m 755 /opt/trustgate

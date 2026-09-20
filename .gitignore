@@ -37,3 +37,6 @@ opencode.json
 # Python virtualenv for the Strands demo agent
 agents/.venv/
 __pycache__/
+
+# release binaries built by `make dist`
+dist/

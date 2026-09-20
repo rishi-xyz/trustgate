@@ -41,7 +41,7 @@ clean:
 	rm -rf bin build .trustgate-dev registry/manifests
 
 # ---- Nitro (run on the enclave-enabled parent instance) ----
-.PHONY: eif eif-check run-enclave forwarder
+.PHONY: eif eif-check run-enclave forwarder dist
 eif:
 	docker build -t trustgate:nitro -f Dockerfile.nitro .
 	nitro-cli build-enclave --docker-uri trustgate:nitro --output-file build/trustgate.eif | tee build/trustgate.pcrs.json
@@ -64,3 +64,13 @@ eif-check:
 	nitro-cli build-enclave --docker-uri trustgate:nitro --output-file build/check2.eif | jq -r .Measurements.PCR0 > build/pcr2
 	@echo "PCR0 build 1: $$(cat build/pcr1)"; echo "PCR0 build 2: $$(cat build/pcr2)"; \
 	  cmp -s build/pcr1 build/pcr2 && echo "REPRODUCIBLE: same source, same measurement" || { echo "DIFFERENT: the image is not reproducible"; exit 1; }
+
+# Verifier CLI binaries for judges (no Go needed), with checksums.
+DIST_PLATFORMS := linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64
+dist:
+	rm -rf dist && mkdir -p dist
+	for p in $(DIST_PLATFORMS); do \
+	  os=$${p%/*}; arch=$${p#*/}; ext=; [ $$os = windows ] && ext=.exe; \
+	  CGO_ENABLED=0 GOOS=$$os GOARCH=$$arch go build $(GOFLAGS_REPRO) -ldflags='-s -w -buildid=' -o dist/trustgate-$$os-$$arch$$ext ./cmd/trustgate || exit 1; \
+	done
+	cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS

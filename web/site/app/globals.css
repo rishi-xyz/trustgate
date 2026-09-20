@@ -1,0 +1,121 @@
+@import "tailwindcss";
+
+:root {
+  --bg: #faf8f4;
+  --bg2: #f2efe8;
+  --fg: #16181d;
+  --muted: #5f636c;
+  --line: #e4e0d6;
+  --card: #ffffff;
+  --accent: #4f46e5;
+  --accent2: #0ea5a4;
+  --accent3: #f59e6b;
+  --ok: #15803d;
+  --bad: #b42318;
+  --ink: #0f1220;
+  --ink-fg: #e8eaf2;
+  --ink-muted: #8b90a6;
+  --ink-line: #252a40;
+  --shadow: 0 1px 2px rgba(20, 20, 30, 0.05), 0 12px 40px -12px rgba(60, 50, 140, 0.22);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0e1017;
+    --bg2: #12151f;
+    --fg: #eceef5;
+    --muted: #9298ab;
+    --line: #232838;
+    --card: #161a26;
+    --accent: #8b8ff8;
+    --accent2: #3cc9c7;
+    --accent3: #f2a37a;
+    --ok: #4cc38a;
+    --bad: #ff7b72;
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 16px 48px -12px rgba(0, 0, 0, 0.6);
+  }
+}
+
+@theme inline {
+  --color-bg: var(--bg);
+  --color-bg2: var(--bg2);
+  --color-fg: var(--fg);
+  --color-muted: var(--muted);
+  --color-line: var(--line);
+  --color-card: var(--card);
+  --color-accent: var(--accent);
+  --color-accent2: var(--accent2);
+  --color-accent3: var(--accent3);
+  --color-ok: var(--ok);
+  --color-bad: var(--bad);
+  --color-ink: var(--ink);
+  --color-ink-fg: var(--ink-fg);
+  --color-ink-muted: var(--ink-muted);
+  --color-ink-line: var(--ink-line);
+  --shadow-soft: var(--shadow);
+  --font-sans: var(--font-inter), system-ui, sans-serif;
+  --font-serif: var(--font-fraunces), Georgia, serif;
+  --font-mono: var(--font-jetbrains), ui-monospace, monospace;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--font-inter), system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+h1,
+h2,
+h3 {
+  font-family: var(--font-fraunces), Georgia, serif;
+  font-weight: 500;
+  letter-spacing: -0.02em;
+  line-height: 1.1;
+}
+
+@keyframes rise {
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.rise {
+  opacity: 0;
+  transform: translateY(6px);
+  animation: rise 0.5s forwards;
+}
+
+.reveal {
+  opacity: 0;
+  transform: translateY(16px);
+  transition:
+    opacity 0.7s,
+    transform 0.7s;
+}
+
+.reveal.on {
+  opacity: 1;
+  transform: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+  .rise {
+    animation: none;
+    opacity: 1;
+    transform: none;
+  }
+  .reveal {
+    opacity: 1;
+    transform: none;
+    transition: none;
+  }
+}

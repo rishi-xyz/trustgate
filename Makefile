@@ -25,7 +25,7 @@ publish: build wasm
 		-max-memory-mb 256 -max-timeout-ms 20000 -out registry/manifests
 	bin/trustgate publish -key .trustgate-dev/publisher.key -wasm build/primes.wasm \
 		-name primes -version 1 -desc "Count primes below N with a sieve (CPU-heavy, for async jobs)" \
-		-max-memory-mb 512 -max-timeout-ms 120000 -out registry/manifests
+		-max-memory-mb 256 -max-timeout-ms 30000 -out registry/manifests
 
 test:
 	go test -count=1 ./...

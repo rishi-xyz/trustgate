@@ -22,4 +22,4 @@ FROM gcr.io/distroless/static-debian12@sha256:d75cdd72874d4790092fcb1b058493ecf6
 # would make Docker create that directory stamped with the build time.
 COPY --from=build /out/ /
 # No TCP inside an enclave: serve over vsock; the parent forwards TCP -> vsock.
-ENTRYPOINT ["/trustgate-server", "-mode", "nitro", "-registry", "/registry", "-publisher-pub-file", "/publisher.pub", "-vsock-port", "8080", "-control-vsock-port", "8081"]
+ENTRYPOINT ["/trustgate-server", "-mode", "nitro", "-registry", "/registry", "-publisher-pub-file", "/publisher.pub", "-vsock-port", "8080", "-control-vsock-port", "8081", "-stateless", "-workers", "2", "-queue-timeout", "10s", "-max-body-mb", "4"]

@@ -4,34 +4,29 @@ Everything in the demo has been run on a real enclave; see `docs/evidence.md` fo
 
 The pitch in one line: **"Don't trust the server. Verify the execution."** And the honest limit, said out loud: **the receipt proves what ran and where, not that the answer is correct.**
 
-## Before you start (pre-flight, 10 minutes)
+## Before you start (pre-flight, 2 minutes)
 
-On the instance (start it in the console first; the IP changes on every start):
-
-1. Security group `trustgate-parent`: SSH and 8443 sources set to **My IP** (your IP may have changed).
-2. `ssh` in, then `~/start-trustgate.sh ~/agent.eif` (or whichever image you are demoing). Expect `RUNNING flags=NONE` and `"mode": "nitro"`.
-3. Note the enclave PCR0 it prints. Export it on the laptop: `export PCR=<PCR0>`.
-4. If you will show the confidential section: the KMS key policy must contain this image's PCR0 and the data owner's `GenerateDataKey` statement, and the owner's access keys must be set in the laptop terminal (`set -x AWS_ACCESS_KEY_ID ...` in fish). Check with `kms-test` on the instance (see `.agent/reopen.md`).
-
-On the laptop:
+The endpoint is always on: **`https://trustmcp.rishixyz.com/mcp`**. It runs as services that start on boot and recover from crashes, so there is no instance to start and no IP to allow-list.
 
 ```bash
-export TRUSTGATE_URL=http://<INSTANCE_IP>:8443
-export PCR=<PCR0>
-# dry run of everything except narration, ends with "every attack was refused ...":
-PAUSE=0 DEMO_SEALED=1 scripts/demo-enclave.sh
+export TRUSTGATE_URL=https://trustmcp.rishixyz.com
+export PCR=81800d9fe493807540feae3c0d325abf185bde59e695ebe98b58a2f8c630e6997b26e0546eb9ed65d3c816ef1bec47d3
+curl -s $TRUSTGATE_URL/.well-known/trustgate | jq '{mode, measurement}'   # nitro + the PCR0 above
+PAUSE=0 scripts/demo-enclave.sh                                            # dry run; ends with "every attack was refused ..."
 ```
 
-The script's preflight refuses to run if the server is not `mode=nitro` with your pinned PCR0, so a wrong or stale build fails before you are on camera. **Run the dry run once before recording.**
+The script's preflight refuses to run if the server is not `mode=nitro` with your pinned PCR0. **Run the dry run once before recording.** If the PCR0 differs, a new enclave build was deployed: use the value from `/.well-known/trustgate` only after checking it against the published one.
 
-The client registrations point at the instance's *current* IP, so update them after every restart:
+Register the endpoint with the clients you will show (once):
 
 ```bash
-claude mcp remove trustgate-enclave; claude mcp add --transport http trustgate-enclave http://<INSTANCE_IP>:8443/mcp
-# opencode: edit the "trustgate-enclave" url in ./opencode.json
+claude mcp add --transport http trustmcp https://trustmcp.rishixyz.com/mcp
+# opencode: {"mcp": {"trustmcp": {"type": "remote", "url": "https://trustmcp.rishixyz.com/mcp", "enabled": true}}} in ./opencode.json
 ```
 
-Start a **new** `claude` or `opencode` session in the repo folder after changing them; running sessions do not pick up new servers.
+Start a **new** `claude` or `opencode` session in the repo folder afterwards; running sessions do not pick up new servers.
+
+**The confidential (sealed) section is not available on the public endpoint** (it holds no AWS credentials, so strangers cannot make it call KMS). Show it from the recorded outputs in `docs/evidence.md` (sections 3 and 6), or run a private window (`docs/production.md`, "Operate").
 
 ## The flow
 
@@ -52,7 +47,7 @@ Start a **new** `claude` or `opencode` session in the repo folder after changing
 Pin your real PCR0 in place of `<PCR0>`.
 
 ```
-Use only the trustgate-enclave MCP tools. (1) Call get_attestation and tell me the mode and measurement. (2) Run the csv-stats workload on this CSV with args value and group:
+Use only the trustmcp MCP tools. (1) Call get_attestation and tell me the mode and measurement. (2) Run the csv-stats workload on this CSV with args value and group:
 group,value
 a,10
 a,12
@@ -70,13 +65,13 @@ c,5000
 Report the per-group sums and any anomaly rows. (3) Call verify_receipt with the receipt_id from step 2 and expected_measurement set to <PCR0>. State precisely whether every check passed, what kind of attestation was used, and whether the measurement matched. Be brief.
 ```
 
-Expected (recorded for both Claude Code and opencode): mode `nitro`, sums a=64 b=66 c=5000, anomaly at row 14, all 5 checks passed with a real Nitro attestation and the measurement matching.
+Expected (recorded for both Claude Code and opencode, through the public URL): mode `nitro`, sums a=64 b=66 c=5000, anomaly at row 14, all 5 checks passed with a real Nitro attestation and the measurement matching.
 
 Say when it lands: "That check ran on the server itself, so it is a convenience. The independent check is the CLI, which I run next."
 
 ## Running the terminal part
 
-`PAUSE=1` (default) waits for Enter before each step, so you narrate at your own pace. Sections that need AWS credentials or SSH are skipped unless you pass `DEMO_SEALED=1` and `SSH_TARGET=ec2-user@<INSTANCE_IP> SSH_KEY=<key.pem>`.
+`PAUSE=1` (default) waits for Enter before each step, so you narrate at your own pace. Sections that need AWS credentials or SSH are skipped unless you pass `DEMO_SEALED=1` and `SSH_TARGET`; both need a private confidential window and are not part of the public demo.
 
 ```bash
 DEMO_SEALED=1 SSH_TARGET=ec2-user@<INSTANCE_IP> SSH_KEY=<key.pem> scripts/demo-enclave.sh

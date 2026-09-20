@@ -1,5 +1,8 @@
 # ignoring private building notes , status and other files
 .agent
+.agents
+.claude
+skills-lock.json
 .env
 *.pem
 .trustgate-dev/

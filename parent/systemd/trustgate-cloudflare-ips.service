@@ -1,0 +1,8 @@
+[Unit]
+Description=Refresh the Cloudflare edge address allow-list for nginx
+
+[Service]
+Type=oneshot
+# The old list is kept if the download fails or looks wrong.
+ExecStart=/opt/trustgate/update-cloudflare-ips.sh
+ExecStartPost=/bin/sh -c 'nginx -t && systemctl reload nginx'

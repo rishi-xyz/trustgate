@@ -10,6 +10,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -18,6 +19,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -86,7 +88,10 @@ func must(t *testing.T, err error) {
 
 func setup(t *testing.T) *env { return setupWith(t, true) }
 
-func setupWith(t *testing.T, withKeys bool) *env {
+func setupWith(t *testing.T, withKeys bool) *env { return setupCfg(t, withKeys, nil) }
+
+// setupCfg is setup with a hook to adjust the server config (workers, limits...).
+func setupCfg(t *testing.T, withKeys bool, mut func(*server.Config)) *env {
 	t.Helper()
 	tmp := t.TempDir()
 	buildDir := "build/test"
@@ -125,6 +130,9 @@ func setupWith(t *testing.T, withKeys bool) *env {
 		devKMS, err = seal.LoadDevKMS(filepath.Join(tmp, "kms.key"))
 		must(t, err)
 		cfg.Keys = devKMS
+	}
+	if mut != nil {
+		mut(&cfg)
 	}
 	srv, err := server.New(cfg)
 	must(t, err)
@@ -835,5 +843,225 @@ func TestReceiptByID(t *testing.T) {
 	aid, _ := jr["result"].(map[string]any)["receipt_id"].(string)
 	if _, av := e.call(t, "verify_receipt", map[string]any{"receipt_id": aid}); av["verified"] != true {
 		t.Fatalf("async receipt by id failed: %+v", av)
+	}
+}
+
+// ---- production hardening ----
+
+func TestBusyWhenAllWorkersAreTaken(t *testing.T) {
+	e := setupCfg(t, false, func(c *server.Config) { c.Workers = 1; c.QueueTimeout = 200 * time.Millisecond })
+
+	// Occupy the only worker for a while with a run that ends at its own timeout.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		e.call(t, "execute", map[string]any{"workload": "spin", "timeout_ms": 400})
+	}()
+	deadline := time.Now().Add(3 * time.Second)
+	for e.srv.Stats().InFlight == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the first run never started")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	start := time.Now()
+	res, _ := e.call(t, "execute", map[string]any{"workload": "hash-bytes", "input": "x"})
+	if !res.IsError || !strings.Contains(fmt.Sprint(res.Content[0].(*mcp.TextContent).Text), "busy") {
+		t.Fatalf("expected a 'server busy' error, got %+v", res)
+	}
+	if took := time.Since(start); took > 2*time.Second {
+		t.Fatalf("the busy answer should come after the queue timeout, took %v", took)
+	}
+	if e.srv.Stats().Rejected != 1 {
+		t.Fatalf("rejection not counted: %+v", e.srv.Stats())
+	}
+
+	// Once the worker is free again the same request works.
+	<-done
+	if res, _ := e.call(t, "execute", map[string]any{"workload": "hash-bytes", "input": "x"}); res.IsError {
+		t.Fatalf("a request after the worker freed up should succeed: %+v", res.Content)
+	}
+}
+
+func TestConcurrentRequestsNeverExceedTheWorkerCap(t *testing.T) {
+	e := setupCfg(t, false, func(c *server.Config) { c.Workers = 2; c.QueueTimeout = 30 * time.Second })
+
+	var peak atomic.Int64
+	stop := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				if n := e.srv.Stats().InFlight; n > peak.Load() {
+					peak.Store(n)
+				}
+				time.Sleep(2 * time.Millisecond)
+			}
+		}
+	}()
+
+	// Ten simultaneous synchronous calls, each holding a worker for ~250 ms.
+	var wg sync.WaitGroup
+	var busy atomic.Int64
+	start := time.Now()
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			res, _ := e.call(t, "execute", map[string]any{"workload": "spin", "timeout_ms": 250})
+			if res.IsError && strings.Contains(res.Content[0].(*mcp.TextContent).Text, "busy") {
+				busy.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+	close(stop)
+
+	if p := peak.Load(); p > 2 {
+		t.Fatalf("peak concurrent runs was %d, the cap is 2", p)
+	}
+	if busy.Load() != 0 {
+		t.Fatalf("with a long queue timeout nothing should be rejected as busy, got %d", busy.Load())
+	}
+	// 10 runs x 250 ms on 2 workers cannot finish faster than about 1.25 s.
+	if took := time.Since(start); took < 1200*time.Millisecond {
+		t.Fatalf("finished in %v: the cap does not seem to be enforced", took)
+	}
+	if got := e.srv.Stats().Executed; got != 10 {
+		t.Fatalf("executed = %d, want 10", got)
+	}
+}
+
+func TestAsyncJobsAndReplayShareTheWorkerPool(t *testing.T) {
+	e := setupCfg(t, false, func(c *server.Config) { c.Workers = 1; c.QueueTimeout = 100 * time.Millisecond })
+
+	// A finished receipt to replay later (this run takes and releases the only worker).
+	_, done := e.execute(t, map[string]any{"workload": "csv-stats", "input": csvData, "args": []string{"amount"}})
+	rid := done["receipt_id"].(string)
+
+	// An async job now holds the only worker.
+	_, job := e.call(t, "execute_async", map[string]any{"workload": "spin-long"})
+	id := job["job_id"].(string)
+	waitJob(t, e, id, "running")
+
+	// Neither a synchronous call nor a replay may bypass the pool.
+	if res, _ := e.call(t, "execute", map[string]any{"workload": "hash-bytes", "input": "x"}); !res.IsError {
+		t.Fatal("sync execute must not bypass the worker pool")
+	}
+	if res, _ := e.call(t, "replay", map[string]any{"receipt_id": rid, "input": csvData}); !res.IsError {
+		t.Fatal("replay runs a workload and must not bypass the worker pool")
+	}
+
+	// Cancelling the job frees the worker, and the same requests then succeed.
+	e.call(t, "cancel_job", map[string]any{"job_id": id})
+	deadline := time.Now().Add(5 * time.Second)
+	for e.srv.Stats().InFlight != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the worker was not released after cancel")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if _, r := e.call(t, "replay", map[string]any{"receipt_id": rid, "input": csvData}); r["replay_matches"] != true {
+		t.Fatalf("replay should work once a worker is free: %+v", r)
+	}
+}
+
+func TestBodyLimit(t *testing.T) {
+	e := setupCfg(t, false, func(c *server.Config) { c.MaxBodyBytes = 8 << 10 })
+	ts := httptest.NewServer(e.srv.Handler())
+	defer ts.Close()
+
+	post := func(size int) int {
+		body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"execute","arguments":{"workload":"hash-bytes","input":"` + strings.Repeat("a", size) + `"}}}`
+		req, _ := http.NewRequest("POST", ts.URL+"/mcp", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "application/json, text/event-stream")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		_, _ = io.Copy(io.Discard, resp.Body)
+		return resp.StatusCode
+	}
+	if code := post(64 << 10); code < 400 {
+		t.Fatalf("a body far above the cap must be refused, got HTTP %d", code)
+	}
+	if code := post(10); code >= 500 {
+		t.Fatalf("a small body must not hit the limit path, got HTTP %d", code)
+	}
+}
+
+func TestStatelessMode(t *testing.T) {
+	e := setupCfg(t, false, func(c *server.Config) { c.Stateless = true })
+	ts := httptest.NewServer(e.srv.Handler())
+	defer ts.Close()
+	ctx := context.Background()
+
+	// A real MCP client works against the stateless server.
+	sess, err := mcp.NewClient(&mcp.Implementation{Name: "stateless"}, nil).Connect(ctx,
+		&mcp.StreamableClientTransport{Endpoint: ts.URL + "/mcp"}, nil)
+	must(t, err)
+	defer sess.Close()
+	res, err := sess.CallTool(ctx, &mcp.CallToolParams{Name: "execute", Arguments: map[string]any{"workload": "csv-stats", "input": csvData, "args": []string{"amount"}}})
+	must(t, err)
+	out, _ := res.StructuredContent.(map[string]any)
+	if res.IsError || out["receipt_id"] == nil {
+		t.Fatalf("execute over a stateless server failed: %+v", res)
+	}
+	// A receipt id from one request can be verified in a later, separate request.
+	vr, err := sess.CallTool(ctx, &mcp.CallToolParams{Name: "verify_receipt", Arguments: map[string]any{"receipt_id": out["receipt_id"], "expected_measurement": e.measure}})
+	must(t, err)
+	if m, _ := vr.StructuredContent.(map[string]any); m["verified"] != true {
+		t.Fatalf("verify by id across requests failed: %+v", m)
+	}
+
+	// No session cookie/header is issued, responses are plain JSON, and the
+	// long-lived GET stream is not offered.
+	body := `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"raw","version":"1"}}}`
+	req, _ := http.NewRequest("POST", ts.URL+"/mcp", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	resp, err := http.DefaultClient.Do(req)
+	must(t, err)
+	resp.Body.Close()
+	if id := resp.Header.Get("Mcp-Session-Id"); id != "" {
+		t.Fatalf("stateless server issued a session id %q", id)
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+		t.Fatalf("stateless responses should be plain JSON, got %q", ct)
+	}
+	get, err := http.Get(ts.URL + "/mcp")
+	must(t, err)
+	get.Body.Close()
+	if get.StatusCode != http.StatusMethodNotAllowed {
+		t.Fatalf("GET /mcp should be 405 in stateless mode, got %d", get.StatusCode)
+	}
+}
+
+func TestHealthzReportsCountersOnly(t *testing.T) {
+	e := setup(t)
+	e.execute(t, map[string]any{"workload": "csv-stats", "input": csvData, "args": []string{"amount"}})
+	ts := httptest.NewServer(e.srv.Handler())
+	defer ts.Close()
+	resp, err := http.Get(ts.URL + "/healthz")
+	must(t, err)
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	var h map[string]any
+	must(t, json.Unmarshal(raw, &h))
+	for _, k := range []string{"status", "uptime_seconds", "workers", "in_flight", "queued", "executed", "rejected_busy"} {
+		if _, ok := h[k]; !ok {
+			t.Errorf("healthz is missing %q: %s", k, raw)
+		}
+	}
+	if h["status"] != "ok" || h["executed"].(float64) < 1 {
+		t.Errorf("unexpected health: %s", raw)
+	}
+	if strings.Contains(string(raw), "acme") || strings.Contains(string(raw), "amount") {
+		t.Errorf("healthz must not contain request data: %s", raw)
 	}
 }

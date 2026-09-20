@@ -1,0 +1,13 @@
+# DISABLED by default. Only needed for confidential (sealed) jobs: the enclave
+# reaches KMS through this proxy. Do not enable on the public instance.
+[Unit]
+Description=vsock proxy to AWS KMS for the enclave
+After=trustgate-enclave.service
+
+[Service]
+ExecStart=/usr/bin/vsock-proxy 8000 kms.ap-south-1.amazonaws.com 443 --config /etc/nitro_enclaves/vsock-proxy.yaml
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

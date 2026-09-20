@@ -1,0 +1,6 @@
+[Unit]
+Description=TrustGate health watchdog
+
+[Service]
+Type=oneshot
+ExecStart=/opt/trustgate/watchdog.sh

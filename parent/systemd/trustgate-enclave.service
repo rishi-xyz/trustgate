@@ -1,0 +1,16 @@
+[Unit]
+Description=TrustGate Nitro Enclave
+After=nitro-enclaves-allocator.service docker.service
+Requires=nitro-enclaves-allocator.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# /opt/trustgate/enclave.eif is a symlink to the image in use; repoint it to roll back.
+ExecStartPre=-/usr/bin/nitro-cli terminate-enclave --all
+# Never add --debug-mode: it zeroes the PCRs and breaks attestation and KMS.
+ExecStart=/usr/bin/nitro-cli run-enclave --cpu-count 2 --memory 3072 --eif-path /opt/trustgate/enclave.eif --enclave-cid 16
+ExecStop=/usr/bin/nitro-cli terminate-enclave --all
+
+[Install]
+WantedBy=multi-user.target

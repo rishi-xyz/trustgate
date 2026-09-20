@@ -1,0 +1,12 @@
+[Unit]
+Description=TrustGate vsock forwarder (localhost:8444 to the enclave)
+After=trustgate-enclave.service
+Requires=trustgate-enclave.service
+
+[Service]
+ExecStart=/opt/trustgate/vsock-forwarder -listen 127.0.0.1:8444 -cid 16 -port 8080
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

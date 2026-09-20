@@ -1,0 +1,15 @@
+# DISABLED by default. Pushes the instance role's credentials into the enclave so
+# it can unwrap data keys for confidential jobs. Leave it off on the public,
+# open endpoint: without credentials the enclave refuses sealed jobs and cannot
+# be used to spam KMS.
+[Unit]
+Description=Push AWS credentials to the enclave (confidential jobs only)
+After=trustgate-enclave.service trustgate-kms-proxy.service
+
+[Service]
+ExecStart=/opt/trustgate/trustgate-parent creds -region ap-south-1 -interval 30m
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

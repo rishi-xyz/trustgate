@@ -1,0 +1,10 @@
+[Unit]
+Description=Run the TrustGate health watchdog every 30 seconds
+
+[Timer]
+OnBootSec=120s
+OnUnitActiveSec=30s
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

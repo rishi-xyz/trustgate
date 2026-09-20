@@ -24,6 +24,7 @@ Builds referenced (PCR0 is the SHA-384 measurement of the whole enclave image; a
 | C | `92de20fec5a521505d849c92cc4827e3ceb9c68bec6d09e98eedc1d50b3e224d09a34afb905822e6ac042bfe6607d2a4` | section 3 |
 | D | `1321d0d4652b0c26ee5a51f3aa11b7f6584e780e23fa2a658a75d6c16c1992efe53bcba047e188f9cda6d7a01c8e74db` | section 6 |
 | E (reproducible build) | `1c680df50a18ba46d3bce7af9d63d653335593a788d25c624aa378c9c9e782072408baf0a836f01d4a6481dc243a030e` | section 7 |
+| F (production, hardened server) | `81800d9fe493807540feae3c0d325abf185bde59e695ebe98b58a2f8c630e6997b26e0546eb9ed65d3c816ef1bec47d3` | section 10 |
 
 Builds A to D were made before builds were reproducible: rebuilding the same source gave a different PCR0 each time, which is why each of those sections pins its own build. Build E onwards is reproducible (section 7).
 
@@ -532,7 +533,135 @@ A problem found on the way: the Strands documentation's example imports `streama
 
 **Not yet run:** the model-driven agent (Bedrock). It needs Bedrock model access and an IAM key for this account; the steps are in `agents/README.md`. Until it is run, what is shown here is that a Strands agent's MCP client works against TrustGate, not that a Bedrock-backed model drives it well.
 
-## 10. What this shows, and what it does not
+## 10. The public endpoint (build F)
+
+The enclave is reachable at **`https://trustmcp.rishixyz.com/mcp`** with no login, so judges can use it themselves. Path: Cloudflare (TLS, rate limit, adds a secret header) to the parent instance over HTTPS (Cloudflare origin certificate, "Full (strict)") to nginx (accepts only Cloudflare's published addresses that also carry the secret header, body cap, per-visitor limit) to a vsock forwarder to the enclave. Build F is the hardened server: stateless MCP with JSON responses, two workers, a 10 s queue wait then a "server busy" error, a 4 MiB body cap, and a shared compiled-module cache (a call went from about 720 ms to about 25 ms). `docs/production.md` is the runbook.
+
+**Why Cloudflare and not CloudFront.** The first design used CloudFront and AWS WAF (`infra/edge-us-east-1.yaml`, still in the repo, lints clean). AWS refused to create the distribution:
+
+```
+Resource handler returned message: "Access denied for operation 'AWS::CloudFront::Distribution: Your account must be verified before you can add new CloudFront resources. To verify your account, please contact AWS Support [...]' (Service: CloudFront, Status Code: 403 [...]) HandlerErrorCode: AccessDenied)
+```
+
+That is an account-level block, not a template error (the WAF web ACL in the same stack was created before it). Cloudflare, which already hosted the domain, replaced it.
+
+### Resilience, on the real instance
+
+```
+# kill the enclave on purpose
+$ sudo nitro-cli terminate-enclave --all
+[... 8 x "still down" ...]
+healthy again after ~90 seconds        # loop counter; the real time from the crash was about 100 to 110 s
+$ sudo journalctl -u trustgate-watchdog ...
+watchdog.sh: trustgate-watchdog: health check failed (3/3)
+watchdog.sh: trustgate-watchdog: restarting the enclave
+$ curl -s http://127.0.0.1:8444/.well-known/trustgate | jq -c '{mode, measurement}'
+{"mode":"nitro","measurement":"81800d9f…c3d816ef1bec47d3"}
+enclave RUNNING flags=NONE
+
+# reboot the instance, then, without starting anything by hand:
+$ uptime -p
+up 10 minutes
+$ systemctl is-active nitro-enclaves-allocator docker trustgate-enclave trustgate-forwarder nginx trustgate-watchdog.timer
+active  (six times)
+$ nitro-cli describe-enclaves | jq -r '.[0] | "\(.EnclaveName) \(.State) flags=\(.Flags)"'
+enclave RUNNING flags=NONE
+$ curl -s http://127.0.0.1:8444/healthz
+{"status":"ok","uptime_seconds":647,"workers":2,"in_flight":0,"queued":0,"executed":0,"rejected_busy":0}
+```
+
+A crash costs roughly a two-minute outage; a reboot brings the whole stack back on its own.
+
+### The origin cannot be used except through Cloudflare
+
+```
+$ curl -sk -o /dev/null -w 'direct to origin: HTTP %{http_code}\n' https://<ORIGIN_IP>/healthz
+direct to origin: HTTP 403
+```
+
+Direct requests fail because the peer is not a Cloudflare address, even with the right secret and a spoofed `CF-Connecting-IP` (checked by `parent/test-nginx.sh`, which runs the real nginx configuration in Docker with 22 checks).
+
+### Through the public URL
+
+```
+$ curl -s https://trustmcp.rishixyz.com/.well-known/trustgate | jq '{mode, measurement}'
+{ "mode": "nitro", "measurement": "81800d9fe493807540feae3c0d325abf185bde59e695ebe98b58a2f8c630e6997b26e0546eb9ed65d3c816ef1bec47d3" }
+$ curl -s https://trustmcp.rishixyz.com/healthz
+{"status":"ok","uptime_seconds":2116,"workers":2,"in_flight":0,"queued":0,"executed":0,"rejected_busy":0}
+```
+
+The Go CLI, then independent verification pinned to the measurement:
+
+```
+$ trustgate exec -url https://trustmcp.rishixyz.com/mcp -workload csv-stats -input testdata/transactions.csv -args amount,supplier
+status: success
+{"column":"amount","count":15,"sum":51405.35,[...]"anomalies":[{"row":16,"value":50000,"z":3.7416571662382503}]}
+$ trustgate verify pub.json -measurement 81800d9f…c3d816ef1bec47d3
+✓ enclave measurement: matches pinned 81800d9f…
+EXECUTION VERIFIED (proves what ran and where, not that the result is correct)
+```
+
+The Strands MCP client (`--check`), pinned:
+
+```
+mode: nitro | measurement: 81800d9fe493807540feae3c0d325abf...
+execute: success | receipt_id: boot-c9540471-2
+  [pass] receipt signature    [pass] attestation reference    [pass] attestation document
+  [pass] signing key binding  [pass] enclave measurement
+verified: True
+```
+
+The guided demo script (`scripts/demo-enclave.sh`, non-confidential sections), including replay on this machine with a module built on the laptop and all three tamper attacks:
+
+```
+== 3. ...and replay it on this machine
+✓ replay output hash: replayed output hash matches receipt
+== 4. Attack: change one byte of the input, then replay      VERIFICATION FAILED   ^ refused, as expected
+== 5. Attack: edit the receipt (overwrite the output hash)   VERIFICATION FAILED   ^ refused, as expected
+== 6. Attack: verify against the wrong enclave measurement   VERIFICATION FAILED   ^ refused, as expected
+== 7. Binary input and a long-running async job              (both succeed)
+every attack was refused and every check behaved as expected
+```
+
+### Real agents against the public URL
+
+The same prompt (get the attestation, run `csv-stats` on a 13-row CSV with one outlier, verify the receipt by id with the measurement pinned) with **Claude Code** and with **opencode**; both reported mode `nitro`, sums a=64 b=66 c=5000, the anomaly at row 14, all five checks passing with a real Nitro attestation, and the measurement matching:
+
+```
+Claude Code:  verify_receipt: verified: true, and all 5 checks passed [...] a real AWS Nitro Enclaves attestation,
+              not a simulated one. The measurement matched your expected value exactly.
+opencode:     Receipt verification: verified=true, all 5 checks passed [...] Attestation was Nitro and the measurement matched.
+```
+
+### Behaviour under abuse, from one IP
+
+```
+# 300 requests, 30 in parallel, to /healthz through Cloudflare
+     99 200     201 429
+# 15 seconds later
+HTTP 200
+
+# 8 simultaneous CPU-heavy jobs (primes below 60,000,000) with 2 workers and a 10 s queue wait
+      6 error: execute: server busy: all workers are in use, retry in a few seconds
+      2 status: success
+# afterwards
+{"status":"ok","uptime_seconds":2310,"workers":2,"in_flight":0,"queued":0,"executed":9,"rejected_busy":6}
+```
+
+The rate limit (100 requests per 10 seconds per IP on Cloudflare's free plan) blocked the flood and recovered within seconds; the worker cap turned an overload into clear, retryable errors and the enclave stayed healthy. Note the trade-off: under a burst of heavy jobs most callers are told to retry. That is intended, and the limit of two workers is what protects the enclave.
+
+### Problems found on the way (kept for honesty)
+
+- The installer failed on the instance twice with problems my local tests could not show: Amazon Linux 2023's `curl-minimal` conflicts with a package named `curl`, and nginx's default `map` bucket is too small for a real 64-character secret (my tests had used a short one). Both are fixed, and `parent/test-nginx.sh` now tests with a real-length secret and the real Cloudflare address ranges.
+- That test suite found two of my own bugs before they reached the instance: a "self-signed?" check that compared `subject=` text to `issuer=` text (never equal), and a miscount caused by Cloudflare's files having no trailing newline.
+- An installer run that reused an old script (an empty tarball was shipped because the command ran in the wrong folder) was caught because its output text was the old wording.
+- The CloudFront block above.
+
+### What is not covered
+
+Confidential (sealed) jobs are switched off on the public endpoint: the enclave holds no AWS credentials there, so a stranger cannot make it call KMS. They were demonstrated separately on a private endpoint (sections 3 and 6). The KMS key policy still names the measurement of an earlier build, so a private confidential window on this build needs the policy updated first.
+
+## 11. What this shows, and what it does not
 
 **Shown:**
 - A workload's identity, input and output are committed in a signed receipt, and the signing key is bound to a real Nitro attestation document that anyone can verify against the AWS root.

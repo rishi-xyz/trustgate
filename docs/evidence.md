@@ -494,7 +494,45 @@ Unit tests in `lambda/verifier` (same fixture, no network): valid receipt passes
 
 **Limits.** The verifier checks signature, attestation, key binding and a pinned measurement; it does not replay the workload (that needs the `.wasm`). It is only as independent as where you run it and what measurement you pin. The test receipt embeds the EC2 instance and enclave IDs, as every Nitro attestation does.
 
-## 9. What this shows, and what it does not
+## 9. A Strands agent (AWS Strands Agents SDK) using the MCP tools
+
+`agents/strands_demo.py` is an agent written with AWS Strands Agents that connects to TrustGate with Strands' own MCP client (streamable HTTP), lists the tools, runs a job and verifies the receipt by `receipt_id`. Strands 1.56.0 and mcp 1.30.0 were used. The `--check` mode exercises this whole path **without any model or AWS credentials**, so it tests the MCP integration itself.
+
+Against a local dev server (dev-mode attestation, insecure, so no measurement was pinned and that check is skipped):
+
+```
+$ agents/.venv/bin/python agents/strands_demo.py --url http://localhost:18080/mcp --check
+tools: cancel_job, execute, execute_async, get_attestation, job_result, job_status, list_workloads, replay, verify_receipt
+mode: dev | measurement: c8138a8cbbd524c62a4b513a5958100d...
+execute: success | receipt_id: boot-9341e314-1
+  [pass] receipt signature
+  [pass] attestation reference
+  [pass] attestation document
+  [pass] signing key binding
+  [skip] enclave measurement
+verified: True
+```
+
+Against the **real enclave** (build E) with its PCR0 pinned:
+
+```
+$ agents/.venv/bin/python agents/strands_demo.py --url http://<INSTANCE_IP>:8443/mcp --pcr 1c680df5…a030e --check
+tools: cancel_job, execute, execute_async, get_attestation, job_result, job_status, list_workloads, replay, verify_receipt
+mode: nitro | measurement: 1c680df50a18ba46d3bce7af9d63d653...
+execute: success | receipt_id: boot-c89ee9b5-7
+  [pass] receipt signature
+  [pass] attestation reference
+  [pass] attestation document
+  [pass] signing key binding
+  [pass] enclave measurement
+verified: True
+```
+
+A problem found on the way: the Strands documentation's example imports `streamablehttp_client` from `mcp.client.streamable_http`, but the newest `mcp` (2.1.1) renamed it and moved headers into an httpx client object, so the import failed. Strands itself accepts `mcp>=1.23,<2.2`; `agents/requirements.txt` pins `mcp<2`.
+
+**Not yet run:** the model-driven agent (Bedrock). It needs Bedrock model access and an IAM key for this account; the steps are in `agents/README.md`. Until it is run, what is shown here is that a Strands agent's MCP client works against TrustGate, not that a Bedrock-backed model drives it well.
+
+## 10. What this shows, and what it does not
 
 **Shown:**
 - A workload's identity, input and output are committed in a signed receipt, and the signing key is bound to a real Nitro attestation document that anyone can verify against the AWS root.

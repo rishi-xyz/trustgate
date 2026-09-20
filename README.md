@@ -79,4 +79,5 @@ See `.agent/setup.md` for MCP client setup and the AWS steps.
 - `cmd/vsock-forwarder`, `cmd/trustgate-parent` parent-side helpers for Nitro
 - `Dockerfile.nitro` enclave image (registry and publisher key baked in, so they are part of the measurement)
 - `lambda/verifier`, `web/verify.html` independent receipt verifier (Lambda, tested with SAM Local) and its web page
+- `agents/` a Strands (AWS) agent that drives TrustGate over MCP with Bedrock; `--check` tests the MCP path without a model
 - `tests/` end-to-end and attack tests

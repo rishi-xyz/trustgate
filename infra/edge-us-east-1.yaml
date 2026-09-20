@@ -1,0 +1,117 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  TrustGate public edge: CloudFront with a custom domain and HTTPS, an AWS WAF
+  web ACL (per-IP rate limit plus the Amazon IP reputation list), in front of the
+  enclave parent instance. Deploy in us-east-1: CloudFront and its WAF web ACL
+  and certificate live there. The certificate must already be issued (request it
+  in ACM in us-east-1 first).
+
+Parameters:
+  DomainName:
+    Type: String
+    Description: Public hostname, for example mcp.example.com. Add a CNAME to the CloudFront name output afterwards.
+  CertificateArn:
+    Type: String
+    Description: ARN of an ISSUED ACM certificate in us-east-1 covering DomainName.
+    AllowedPattern: 'arn:aws:acm:us-east-1:[0-9]{12}:certificate/[a-f0-9-]+'
+    ConstraintDescription: must be an ACM certificate ARN in us-east-1
+  OriginDnsName:
+    Type: String
+    Description: >
+      Public DNS name of the parent instance's Elastic IP, for example
+      ec2-1-2-3-4.ap-south-1.compute.amazonaws.com (CloudFront needs a DNS name, not an IP).
+  OriginSecret:
+    Type: String
+    NoEcho: true
+    MinLength: 32
+    Description: Value of /etc/trustgate/origin-secret on the parent. CloudFront sends it as X-Origin-Verify; nginx refuses requests without it.
+  RateLimitPer5Min:
+    Type: Number
+    Default: 1000
+    MinValue: 10
+    Description: >
+      Requests allowed per client IP in 5 minutes before WAF blocks it. Judges on one
+      venue network share an IP, so keep this generous; nginx adds a per-second limit.
+
+Resources:
+  WebACL:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: trustgate-edge
+      Scope: CLOUDFRONT
+      DefaultAction: { Allow: {} }
+      VisibilityConfig:
+        CloudWatchMetricsEnabled: true
+        MetricName: trustgate-edge
+        SampledRequestsEnabled: true
+      Rules:
+        - Name: rate-limit-per-ip
+          Priority: 1
+          Action: { Block: {} }
+          Statement:
+            RateBasedStatement:
+              Limit: !Ref RateLimitPer5Min
+              AggregateKeyType: IP
+              EvaluationWindowSec: 300
+          VisibilityConfig:
+            CloudWatchMetricsEnabled: true
+            MetricName: rate-limit-per-ip
+            SampledRequestsEnabled: true
+        - Name: amazon-ip-reputation
+          Priority: 2
+          OverrideAction: { None: {} }
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesAmazonIpReputationList
+          VisibilityConfig:
+            CloudWatchMetricsEnabled: true
+            MetricName: amazon-ip-reputation
+            SampledRequestsEnabled: true
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: TrustGate MCP endpoint
+        Aliases: [!Ref DomainName]
+        HttpVersion: http2
+        IPV6Enabled: true
+        PriceClass: PriceClass_200
+        WebACLId: !GetAtt WebACL.Arn
+        ViewerCertificate:
+          AcmCertificateArn: !Ref CertificateArn
+          SslSupportMethod: sni-only
+          MinimumProtocolVersion: TLSv1.2_2021
+        Origins:
+          - Id: parent
+            DomainName: !Ref OriginDnsName
+            CustomOriginConfig:
+              OriginProtocolPolicy: http-only
+              HTTPPort: 8443
+              HTTPSPort: 443
+              OriginReadTimeout: 60          # the standard maximum; long work belongs in async jobs
+              OriginKeepaliveTimeout: 30
+            OriginCustomHeaders:
+              - HeaderName: X-Origin-Verify
+                HeaderValue: !Ref OriginSecret
+        DefaultCacheBehavior:
+          TargetOriginId: parent
+          ViewerProtocolPolicy: https-only    # a redirect would break POST requests
+          AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad             # CachingDisabled (managed)
+          OriginRequestPolicyId: 33f36d7e-f396-46d9-90e0-52428a34d9dc      # AllViewerAndCloudFrontHeaders-2022-06 (managed): forwards CloudFront-Viewer-Address
+          Compress: false
+
+Outputs:
+  CloudFrontDomainName:
+    Description: Create a CNAME from your DomainName to this value.
+    Value: !GetAtt Distribution.DomainName
+  DistributionId:
+    Description: Disable this distribution to take the public endpoint down.
+    Value: !Ref Distribution
+  WebACLArn:
+    Value: !GetAtt WebACL.Arn
+  PublicUrl:
+    Value: !Sub 'https://${DomainName}/mcp'

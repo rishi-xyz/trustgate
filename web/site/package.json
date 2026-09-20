@@ -5,7 +5,9 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
-    "start": "next start"
+    "build:static": "STATIC_EXPORT=1 next build",
+    "start": "next start",
+    "preview:static": "npx serve@latest out -l 4000"
   },
   "dependencies": {
     "next": "16.3.5",

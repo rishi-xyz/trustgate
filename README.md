@@ -15,7 +15,7 @@ Two modes, same code:
   - AWS KMS releases a secret only to the enclave with the exact measured image; the parent instance's own credentials and a modified image are both denied;
   - confidential jobs: an input sealed by a separate data-owner identity is unwrapped only by the attested enclave and the result comes back sealed. A packet capture on the parent instance of a sealed job contained none of the data or results, while the same job unsealed did; and a hostile parent that re-targets the ciphertext at another approved workload is refused.
 
-Known gaps: builds are not reproducible yet (every rebuild changes PCR0, so the KMS key policy must be updated), transport to the MCP endpoint is plain HTTP.
+Known gaps: WASM workload builds are reproducible (independent of the git revision, so a receipt can be replayed against a module built later), but whether an enclave image rebuilt from the same source gets the same PCR0 is not yet confirmed (until it is, every rebuild means updating the KMS key policy); transport to the MCP endpoint is plain HTTP.
 
 TrustGate proves what code ran on which input in which environment. It does not prove the result is correct.
 

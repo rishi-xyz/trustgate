@@ -1,0 +1,4 @@
+strands-agents
+# mcp 2.x moved HTTP headers into an httpx client object; the Strands docs and this
+# script use the 1.x streamablehttp_client(url, headers=...) form.
+mcp>=1.23,<2

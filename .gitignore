@@ -33,3 +33,7 @@ opencode.json
 
 # SAM build output
 .aws-sam/
+
+# Python virtualenv for the Strands demo agent
+agents/.venv/
+__pycache__/

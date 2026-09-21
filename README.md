@@ -1,10 +1,72 @@
 # TrustGate
 
-A verifiable remote execution environment for AI agents: attested compute with signed proof receipts. An MCP agent submits an approved WebAssembly workload; it runs under deny-by-default capabilities and resource limits inside an isolated, measured, attested environment; the agent gets the result plus a signed receipt that can be independently verified and, for deterministic workloads, replayed.
+**Verifiable remote execution for AI agents: attested compute with signed proof receipts.**
+
+An MCP agent submits an approved WebAssembly workload. It runs under deny-by-default capabilities and resource limits inside an isolated, measured, attested AWS Nitro Enclave. The agent gets back the result plus a signed receipt that anyone can verify independently and, for deterministic workloads, replay.
 
 "Trustless" here means you check a receipt instead of trusting the host or the agent's word. AWS Nitro remains the root of trust.
 
-> **Proof of execution and environment, not proof of correctness.**
+## Demo
+
+[![TrustGate coding demo](https://img.youtube.com/vi/J9kMaQg4tGU/maxresdefault.jpg)](https://youtu.be/J9kMaQg4tGU)
+
+Watch the coding demo on YouTube: https://youtu.be/J9kMaQg4tGU
+
+## Quick start
+
+A public TrustGate server runs on a real AWS Nitro Enclave. No login, sample data only.
+
+| | |
+|---|---|
+| **MCP URL** | `https://trustmcp.rishixyz.com/mcp` (Streamable HTTP) |
+| **Published enclave measurement (PCR0)** | `81800d9fe493807540feae3c0d325abf185bde59e695ebe98b58a2f8c630e6997b26e0546eb9ed65d3c816ef1bec47d3` |
+
+Add it to your MCP client:
+
+**Claude Code**
+
+```bash
+claude mcp add --transport http trustmcp https://trustmcp.rishixyz.com/mcp
+```
+
+**opencode** (`opencode.json`)
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "trustmcp": {
+      "type": "remote",
+      "url": "https://trustmcp.rishixyz.com/mcp",
+      "enabled": true
+    }
+  }
+}
+```
+
+**Any other MCP client**: choose the Streamable HTTP transport and use the URL above. To poke at it interactively: `npx @modelcontextprotocol/inspector`.
+
+Then ask your agent to call `list_workloads`, run one with `execute`, and pass the returned `receipt_id` to `verify_receipt` with the PCR0 above. `docs/judge-guide.md` walks through it step by step.
+
+## Installation (run it yourself)
+
+Prerequisites: Go 1.26+, make, jq. Docker and Node are optional (Docker for `docker compose`, Node for the MCP Inspector and the website).
+
+```bash
+git clone https://github.com/rishi-xyz/trustgate.git
+cd trustgate
+make test    # unit + e2e tests, including tamper and resource-limit attacks
+make demo    # execute -> verify -> replay -> tamper, all local
+make run-dev # serve a local dev-mode server on http://localhost:8080/mcp
+```
+
+Local mode (`-mode dev`) uses software attestation and gives no hardware isolation. It is insecure by design: receipts are labelled `dev`, and the verifier rejects them unless `-allow-dev` is passed. To point a client at it:
+
+```bash
+claude mcp add --transport http trustgate-local http://localhost:8080/mcp
+```
+
+For the Nitro deployment see `docs/production.md`; for client setup and the AWS steps see `.agent/setup.md`.
 
 ## The execution environment
 
@@ -16,7 +78,7 @@ The environment is what makes a receipt worth checking:
 
 A receipt is the proof that a given job ran in that environment.
 
-## Status
+## Modes and guarantees
 
 Two modes, same code:
 
@@ -27,7 +89,7 @@ Two modes, same code:
   - AWS KMS releases a secret only to the enclave with the exact measured image; the parent instance's own credentials and a modified image are both denied;
   - confidential jobs: an input sealed by a separate data-owner identity is unwrapped only by the attested enclave and the result comes back sealed. A packet capture on the parent instance of a sealed job contained none of the data or results, while the same job unsealed did; and a hostile parent that re-targets the ciphertext at another approved workload is refused.
 
-Known gaps: WASM workload builds are reproducible (independent of the git revision, so a receipt can be replayed against a module built later), but whether an enclave image rebuilt from the same source gets the same PCR0 is not yet confirmed (until it is, every rebuild means updating the KMS key policy); transport to the MCP endpoint is plain HTTP.
+Known limitations: WASM workload builds are reproducible (independent of the git revision, so a receipt can be replayed against a module built later), but whether an enclave image rebuilt from the same source gets the same PCR0 is not yet confirmed (until it is, every rebuild means updating the KMS key policy); transport to the MCP endpoint is plain HTTP.
 
 TrustGate proves what code ran on which input in which environment. It does not prove the result is correct.
 
@@ -70,22 +132,13 @@ curl -s -X POST localhost:3000/verify -H 'Content-Type: application/json' \
 
 Build with `CGO_ENABLED=0`, so the binary does not depend on the host's glibc. `sam deploy` (not done) would publish it as a public URL. The test fixture `lambda/verifier/testdata/nitro-receipt.json` is a real receipt from a real enclave run; like every Nitro attestation it contains the EC2 instance and enclave IDs, but no credentials or account ID.
 
-## Try it
+## Documentation
 
-A public endpoint is running on a real AWS Nitro Enclave: **`https://trustmcp.rishixyz.com/mcp`** (MCP over HTTPS, no login; sample data only). Published enclave measurement (PCR0): `81800d9fe493807540feae3c0d325abf185bde59e695ebe98b58a2f8c630e6997b26e0546eb9ed65d3c816ef1bec47d3`. See `docs/judge-guide.md`.
-
-## Running it for others
-
-`docs/production.md` is the runbook for a public HTTPS deployment (CloudFront and WAF in front, nginx and systemd on the parent, a hardened stateless server in the enclave), with the limits stated plainly. `docs/judge-guide.md` is what to give someone who wants to try it.
-
-## Quick start (local)
-
-```bash
-make test    # unit + e2e tests, including tamper and resource-limit attacks
-make demo    # execute -> verify -> replay -> tamper, all local
-```
-
-See `.agent/setup.md` for MCP client setup and the AWS steps.
+- `docs/judge-guide.md`: how to try the public endpoint
+- `docs/production.md`: runbook for a public HTTPS deployment (CloudFront and WAF in front, nginx and systemd on the parent, a hardened stateless server in the enclave), with the limits stated plainly
+- `docs/evidence.md`: evidence from real Nitro runs
+- `docs/demo-script.md`: demo runbook
+- `.agent/setup.md`: MCP client setup and the AWS steps
 
 ## Layout
 
